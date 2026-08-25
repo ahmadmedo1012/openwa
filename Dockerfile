@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 FROM node:22-alpine AS build
 WORKDIR /app
+# git is required by npm when a dependency resolves from a git URL.
+RUN apk add --no-cache git
 COPY package.json ./
 RUN npm install --no-audit --no-fund
 COPY tsconfig.json ./
