@@ -30,6 +30,14 @@ import {
   type WASocket,
 } from "@whiskeysockets/baileys";
 import { nanoid } from "nanoid";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import {
+  persistenceEnabled,
+  scheduleSave,
+  loadCreds,
+  listPersistedNames,
+} from "./persist.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -92,6 +100,32 @@ async function startSession(rs: RuntimeSession): Promise<void> {
   rs.stopRequested = false;
   rs.qrString = undefined;
 
+  // Restore persisted credentials (if any) into the auth folder BEFORE the
+  // engine reads it — this is what makes restarts/deploy self-healing.
+  if (persistenceEnabled()) {
+    try {
+      const dir = `${DATA_DIR}/sessions/${rs.name}`;
+      const existing = await fs.readdir(dir).catch(() => [] as string[]);
+      const hasCreds = existing.includes("creds.json");
+      if (!hasCreds) {
+        const blob = await loadCreds(rs.name);
+        if (blob) {
+          await fs.mkdir(dir, { recursive: true });
+          const creds = JSON.parse(blob) as Record<string, unknown>;
+          for (const [fname, content] of Object.entries(creds)) {
+            await fs.writeFile(
+              path.join(dir, fname),
+              typeof content === "string" ? content : JSON.stringify(content),
+            );
+          }
+          log.info({ sessionId: rs.id, name: rs.name }, "[persist] credentials restored from DB");
+        }
+      }
+    } catch (err) {
+      log.warn({ err, name: rs.name }, "[persist] restore failed — continuing fresh");
+    }
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(`${DATA_DIR}/sessions/${rs.name}`);
   let version: [number, number, number] | undefined;
   try {
@@ -118,7 +152,20 @@ async function startSession(rs: RuntimeSession): Promise<void> {
   });
   rs.socket = sock;
 
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", () => {
+    void Promise.resolve(saveCreds()).then(() => {
+      if (!persistenceEnabled()) return;
+      scheduleSave(rs.name, async () => {
+        const dir = `${DATA_DIR}/sessions/${rs.name}`;
+        const files = await fs.readdir(dir);
+        const out: Record<string, string> = {};
+        for (const f of files) {
+          out[f] = await fs.readFile(path.join(dir, f), "utf8");
+        }
+        return JSON.stringify(out);
+      });
+    });
+  });
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -403,6 +450,29 @@ app.post("/api/sessions/:id/messages/send-text", async (req, res) => {
 // JSON 404 for anything else under /api
 app.use("/api", (_req, res) => res.status(404).json({ error: "not found" }));
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", async () => {
   log.info({ port: PORT, dataDir: DATA_DIR }, "[gateway] listening");
+
+  // Self-heal: auto-create + start every persisted session so a restart or
+  // redeploy restores WhatsApp pairing without any operator action.
+  if (!persistenceEnabled()) return;
+  try {
+    const names = await listPersistedNames();
+    for (const name of names) {
+      if (findByName(name)) continue;
+      const rs: RuntimeSession = {
+        id: `sess_${nanoid(16)}`,
+        name,
+        status: "initializing",
+        createdAt: new Date().toISOString(),
+      };
+      sessions.set(rs.id, rs);
+      await startSession(rs).catch((err) =>
+        log.error({ err, name }, "[boot] auto-restore failed"),
+      );
+      log.info({ name }, "[boot] session restored from persistence");
+    }
+  } catch (err) {
+    log.warn({ err }, "[boot] persistence scan failed");
+  }
 });

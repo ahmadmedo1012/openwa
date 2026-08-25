@@ -14,9 +14,11 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@types/pg": "^8.23.1",
     "@whiskeysockets/baileys": "^6.7.9",
     "express": "^4.21.2",
     "nanoid": "^5.0.9",
+    "pg": "^8.23.0",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4"
   },
