@@ -103,7 +103,11 @@ async function startSession(rs) {
     rs.socket = sock;
     sock.ev.on("creds.update", () => {
         void Promise.resolve(saveCreds()).then(() => {
-            if (!persistenceEnabled())
+            // Persist ONLY once the session has proven itself connected at least
+            // once. creds.update fires during pairing with INTERIM credentials;
+            // saving those captured half-paired state, and every later boot
+            // restored credentials WhatsApp had already invalidated.
+            if (!persistenceEnabled() || !rs.lastReadyAt)
                 return;
             scheduleSave(rs.name, async () => {
                 const dir = `${DATA_DIR}/sessions/${rs.name}`;
