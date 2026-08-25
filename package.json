@@ -1,0 +1,30 @@
+{
+  "name": "openwa-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WhatsApp multi-session REST gateway (Baileys-based) — implements the OpenWA session/send-text contract consumed by SubNation's whatsapp-otp.service",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "express": "^4.21.2",
+    "nanoid": "^5.0.9",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.5",
+    "@types/qrcode": "^1.5.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
