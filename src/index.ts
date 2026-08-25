@@ -37,6 +37,7 @@ import {
   scheduleSave,
   loadCreds,
   listPersistedNames,
+  deletePersisted,
 } from "./persist.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
@@ -424,6 +425,23 @@ app.post("/api/sessions/:id/pair-code", async (req, res) => {
   }
 });
 
+// Delete a session (stops engine, wipes local + persisted credentials).
+app.delete("/api/sessions/:id", async (req, res) => {
+  const rs = findOr404(req.params.id, res);
+  if (!rs) return;
+  try {
+    rs.stopRequested = true;
+    rs.socket?.end(undefined);
+  } catch {
+    // engine may already be dead
+  }
+  sessions.delete(rs.id);
+  await fs.rm(`${DATA_DIR}/sessions/${rs.name}`, { recursive: true, force: true }).catch(() => {});
+  deletePersisted(rs.name);
+  log.info({ sessionId: rs.id, name: rs.name }, "[session] deleted");
+  return res.json({ deleted: true, id: rs.id });
+});
+
 // Send text
 app.post("/api/sessions/:id/messages/send-text", async (req, res) => {
   const rs = findOr404(req.params.id, res);
@@ -475,4 +493,14 @@ app.listen(PORT, "0.0.0.0", async () => {
   } catch (err) {
     log.warn({ err }, "[boot] persistence scan failed");
   }
+});
+
+// ── Last-resort process guards ────────────────────────────────────────────────
+// A throw inside a Baileys event callback must never take the whole gateway
+// (and every live WhatsApp session) down. Log loudly and keep serving.
+process.on("uncaughtException", (err) => {
+  log.error({ err }, "[process] uncaughtException — keeping the process alive");
+});
+process.on("unhandledRejection", (reason) => {
+  log.error({ reason: String(reason) }, "[process] unhandledRejection — keeping the process alive");
 });
