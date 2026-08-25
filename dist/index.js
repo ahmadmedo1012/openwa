@@ -70,7 +70,7 @@ async function startSession(rs) {
         version,
         auth: state,
         printQRInTerminal: false,
-        browser: ["SubNation OTP", "Chrome", "1.0.0"],
+        browser: ["Windows", "Chrome", "133.0"],
         markOnlineOnConnect: false,
         syncFullHistory: false,
     });
@@ -184,6 +184,7 @@ app.get("/api/docs", (_req, res) => {
             "GET    /api/sessions/{id}",
             "POST   /api/sessions                body: {name}",
             "POST   /api/sessions/{id}/start",
+            "POST   /api/sessions/{id}/pair-code  body: {phone}",
             "GET    /api/sessions/{id}/qr        (operator: scan with WhatsApp)",
             "POST   /api/sessions/{id}/messages/send-text   body: {chatId,text}",
             "GET    /api/sessions/{id}/contacts/check/{number}",
@@ -285,6 +286,31 @@ app.get("/api/sessions/:id/contacts/check/:number", async (req, res) => {
     catch (err) {
         log.warn({ err, sessionId: rs.id }, "[contacts/check] failed");
         return res.status(500).json({ error: "check_failed" });
+    }
+});
+// Request a phone-number pairing code (the reliable alternative to QR:
+// no rotation timing, entered manually on the phone under
+// Linked devices → "Link with phone number instead").
+app.post("/api/sessions/:id/pair-code", async (req, res) => {
+    const rs = findOr404(req.params.id, res);
+    if (!rs)
+        return;
+    if (!rs.socket) {
+        return res.status(409).json({ error: "session_not_started", status: rs.status });
+    }
+    const phone = String(req.body?.phone ?? "").replace(/[^0-9]/g, "");
+    if (phone.length < 10 || phone.length > 15) {
+        return res.status(400).json({ error: "phone must be E.164 digits (e.g. 21891XXXXXXX)" });
+    }
+    try {
+        const code = await rs.socket.requestPairingCode(phone);
+        rs.qrString = undefined;
+        log.info({ sessionId: rs.id }, "[pair-code] issued");
+        return res.json({ id: rs.id, name: rs.name, status: rs.status, code });
+    }
+    catch (err) {
+        log.error({ err, sessionId: rs.id }, "[pair-code] request failed");
+        return res.status(500).json({ error: "pair_code_failed" });
     }
 });
 // Send text
