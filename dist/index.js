@@ -45,6 +45,7 @@ function publicView(s) {
         status: s.status,
         createdAt: s.createdAt,
         ...(s.lastReadyAt ? { lastReadyAt: s.lastReadyAt } : {}),
+        ...(s.lastDeliveryStatus ? { lastDeliveryStatus: s.lastDeliveryStatus } : {}),
     };
 }
 function findByName(name) {
@@ -115,6 +116,29 @@ async function startSession(rs) {
         });
     };
     rs.persistSnapshot = persistSnapshot;
+    // Outbound delivery tracking: WhatsApp acks our sent messages through
+    // messages.update (PENDING → SERVER_ACK → DELIVERED/READ, or ERROR).
+    // Without this, an undecryptable/stuck message looked identical to a
+    // delivered one from the API's perspective.
+    sock.ev.on("messages.upsert", (upsert) => {
+        if (upsert.type !== "notify")
+            return;
+        for (const m of upsert.messages) {
+            if (m.key.fromMe && typeof m.key.id === "string")
+                rs.lastOutMsgId = m.key.id;
+        }
+    });
+    sock.ev.on("messages.update", (updates) => {
+        for (const u of updates) {
+            if (u.key.id && u.key.id === rs.lastOutMsgId && u.update?.status != null) {
+                const prev = rs.lastDeliveryStatus;
+                rs.lastDeliveryStatus = String(u.update.status);
+                if (prev !== rs.lastDeliveryStatus) {
+                    log.info({ sessionId: rs.id, status: rs.lastDeliveryStatus }, "[delivery] status");
+                }
+            }
+        }
+    });
     sock.ev.on("creds.update", () => {
         void Promise.resolve(saveCreds()).then(() => {
             // Persist ONLY once the session has proven itself connected at least
@@ -152,9 +176,19 @@ async function startSession(rs) {
             const loggedOut = code === DisconnectReason.loggedOut;
             if (loggedOut || rs.stopRequested) {
                 // Pairing revoked (device logged out elsewhere) — credentials are
-                // dead. Wipe so the next start issues a fresh QR.
+                // dead. Wipe LOCAL dir AND the persisted blob, otherwise every boot
+                // resurrected dead creds into the same failed loop.
                 rs.status = "failed";
                 rs.socket = undefined;
+                void (async () => {
+                    try {
+                        await fs.rm(`${DATA_DIR}/sessions/${rs.name}`, { recursive: true, force: true });
+                        const { deletePersisted } = await import("./persist.js");
+                        deletePersisted(rs.name);
+                        log.warn({ sessionId: rs.id, name: rs.name }, "[session] dead credentials wiped (local+persistence)");
+                    }
+                    catch { }
+                })();
                 log.warn({ sessionId: rs.id, name: rs.name, loggedOut }, "[session] closed permanently");
                 void restartable(rs);
                 return;
@@ -400,7 +434,7 @@ app.post("/api/sessions/:id/messages/send-text", async (req, res) => {
         // persisted snapshot here keeps restores decryptable (a stale snapshot
         // produced 'waiting for this message' after boot self-heal).
         rs.persistSnapshot?.();
-        return res.json({ ok: true });
+        return res.json({ ok: true, delivery: rs.lastDeliveryStatus ?? "pending" });
     }
     catch (err) {
         log.error({ err, sessionId: rs.id }, "[send-text] failed");
