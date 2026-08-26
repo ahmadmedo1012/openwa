@@ -73,6 +73,7 @@ interface RuntimeSession extends SessionRecord {
   socket?: WASocket;
   qrString?: string;
   stopRequested?: boolean;
+  persistSnapshot?: () => void;
 }
 
 const SESSION_NAME_RE = /^[A-Za-z0-9-]{3,50}$/;
@@ -153,22 +154,27 @@ async function startSession(rs: RuntimeSession): Promise<void> {
   });
   rs.socket = sock;
 
+  const persistSnapshot = (): void => {
+    if (!persistenceEnabled() || !rs.lastReadyAt) return;
+    scheduleSave(rs.name, async () => {
+      const dir = `${DATA_DIR}/sessions/${rs.name}`;
+      const files = await fs.readdir(dir);
+      const out: Record<string, string> = {};
+      for (const f of files) {
+        out[f] = await fs.readFile(path.join(dir, f), "utf8");
+      }
+      return JSON.stringify(out);
+    });
+  };
+  rs.persistSnapshot = persistSnapshot;
+
   sock.ev.on("creds.update", () => {
     void Promise.resolve(saveCreds()).then(() => {
       // Persist ONLY once the session has proven itself connected at least
       // once. creds.update fires during pairing with INTERIM credentials;
       // saving those captured half-paired state, and every later boot
       // restored credentials WhatsApp had already invalidated.
-      if (!persistenceEnabled() || !rs.lastReadyAt) return;
-      scheduleSave(rs.name, async () => {
-        const dir = `${DATA_DIR}/sessions/${rs.name}`;
-        const files = await fs.readdir(dir);
-        const out: Record<string, string> = {};
-        for (const f of files) {
-          out[f] = await fs.readFile(path.join(dir, f), "utf8");
-        }
-        return JSON.stringify(out);
-      });
+      persistSnapshot();
     });
   });
 
@@ -462,6 +468,10 @@ app.post("/api/sessions/:id/messages/send-text", async (req, res) => {
   try {
     await rs.socket.sendMessage(jid, { text });
     log.info({ sessionId: rs.id, chatId: jid.slice(0, jid.indexOf("@")) + "@…" }, "[send-text] delivered to engine");
+    // Sending rotates sender-key material server-side; refreshing the
+    // persisted snapshot here keeps restores decryptable (a stale snapshot
+    // produced 'waiting for this message' after boot self-heal).
+    rs.persistSnapshot?.();
     return res.json({ ok: true });
   } catch (err) {
     log.error({ err, sessionId: rs.id }, "[send-text] failed");
