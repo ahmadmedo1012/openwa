@@ -411,6 +411,21 @@ app.post("/api/sessions/:id/messages/send-text", async (req, res) => {
 app.use("/api", (_req, res) => res.status(404).json({ error: "not found" }));
 app.listen(PORT, "0.0.0.0", async () => {
     log.info({ port: PORT, dataDir: DATA_DIR }, "[gateway] listening");
+    // ── Self-ping keep-alive ────────────────────────────────────────────────
+    // Free-tier instances idle-spin after ~15 min without INBOUND traffic,
+    // which wipes the in-memory session registry. GitHub-cron pings proved
+    // unreliable (jitter 30-55 min). A request to our own PUBLIC URL crosses
+    // Render's router and counts as real traffic — deterministic heartbeat.
+    const publicUrl = (process.env.RENDER_EXTERNAL_URL ?? "").replace(/\/+$/, "");
+    if (publicUrl) {
+        const PING_MS = 4 * 60 * 1000;
+        setInterval(() => {
+            fetch(`${publicUrl}/healthz`, { signal: AbortSignal.timeout(10_000) })
+                .then((r) => log.debug({ status: r.status }, "[keep-alive] self-ping"))
+                .catch((err) => log.warn({ err }, "[keep-alive] self-ping failed"));
+        }, PING_MS);
+        log.info({ publicUrl, everyMs: PING_MS }, "[keep-alive] self-ping armed");
+    }
     // Self-heal: auto-create + start every persisted session so a restart or
     // redeploy restores WhatsApp pairing without any operator action.
     if (!persistenceEnabled())
