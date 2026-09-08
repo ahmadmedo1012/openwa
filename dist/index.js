@@ -28,6 +28,7 @@ import express from "express";
 import pino from "pino";
 import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, } from "@whiskeysockets/baileys";
 import { nanoid } from "nanoid";
+import { timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { persistenceEnabled, scheduleSave, loadCreds, listPersistedNames, deletePersisted, } from "./persist.js";
@@ -235,7 +236,12 @@ function hasStoredCreds(state) {
 }
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function requireKey(req, res) {
-    if ((req.header("x-api-key") ?? "") !== API_KEY) {
+    // SEC1/P3: timing-safe comparison — a plain !== leaks key bytes via
+    // early-exit timing on a high-precision remote clock.
+    const given = Buffer.from(req.header("x-api-key") ?? "");
+    const expected = Buffer.from(API_KEY);
+    const ok = given.length === expected.length && timingSafeEqual(given, expected);
+    if (!ok) {
         res.status(401).json({ error: "invalid or missing X-API-Key" });
         return false;
     }
@@ -254,6 +260,25 @@ function findOr404(id, res) {
 }
 // ── App ──────────────────────────────────────────────────────────────────────
 const app = express();
+// SEC1/P2-2 + P3 hardening: clickjacking backstop for the destructive
+// session-delete dialog, CSP allows only self + the QR data-URL, no
+// server banner, and no browser/proxy caching of any dynamic response.
+app.disable("x-powered-by");
+app.use((_req, res, next) => {
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Content-Security-Policy", 
+    // 'unsafe-inline' for script/style: the pages are 100% server-rendered
+    // templates whose ONLY dynamic values pass through escapeHtml()/esc()
+    // (verified by the red-team sweep) — no third-party or user-supplied
+    // markup ever executes. Everything else is locked to 'none'.
+    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'");
+    if (_req.path.startsWith("/dash/") || _req.path === "/" || _req.path === "/login") {
+        res.setHeader("Cache-Control", "no-store");
+    }
+    next();
+});
 app.use(express.json({ limit: "256kb" }));
 app.get("/healthz", (_req, res) => {
     const ready = [...sessions.values()].filter((s) => s.status === "ready").length;
@@ -313,6 +338,31 @@ async function createSessionRecord(name) {
     log.info({ sessionId: rs.id, name }, "[session] created (dashboard)");
     return { id: rs.id, name: rs.name, status: rs.status, createdAt: rs.createdAt };
 }
+// SEC1/P3: CSRF backstop for the cookie-authenticated dashboard
+// mutations. SameSite=Lax already blocks cross-site POST from rendered
+// pages; this additionally verifies the Origin header browsers ALWAYS
+// attach to non-GET fetches. Absent Origin (curl / server-to-server)
+// is allowed — those callers cannot carry a victim's cookie.
+app.use("/dash", (req, res, next) => {
+    if (req.method === "GET" || req.method === "HEAD")
+        return next();
+    const origin = req.header("origin");
+    if (!origin)
+        return next();
+    let host = null;
+    try {
+        host = new URL(origin).host;
+    }
+    catch {
+        host = null;
+    }
+    const ownHost = req.header("host") ?? "";
+    if (!host || !ownHost || host !== ownHost) {
+        res.status(403).json({ error: "cross_origin_blocked" });
+        return;
+    }
+    return next();
+});
 mountDashboard(app, {
     sessions: () => [...sessions.values()].map(toDashboardView),
     info: () => ({

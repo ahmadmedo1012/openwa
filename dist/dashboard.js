@@ -27,14 +27,22 @@ const DASHBOARD_USERNAME = (process.env.DASHBOARD_USERNAME ?? "").trim().toLower
 const DASHBOARD_PASSWORD = (process.env.DASHBOARD_PASSWORD ?? "").trim();
 const COOKIE_NAME = "openwa_dash";
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+let secretMemo = null;
 function sessionSecret() {
+    if (secretMemo)
+        return secretMemo;
     const explicit = (process.env.DASHBOARD_SESSION_SECRET ?? "").trim();
-    if (explicit.length >= 32)
-        return explicit;
+    if (explicit.length >= 32) {
+        secretMemo = explicit;
+        return secretMemo;
+    }
     // Derive a purpose-scoped key from the API key (which is already a
     // required secret). scrypt with a static salt keeps the derivation
     // slow and the cookie domain independent from the API-key domain.
-    return scryptSync(process.env.OPENWA_API_KEY ?? "", "openwa-dashboard-v1", 32).toString("hex");
+    // Memoized (SEC1/P1-2): the sync derivation ran on EVERY cookie
+    // verification — an unauthenticated CPU-DoS surface.
+    secretMemo = scryptSync(process.env.OPENWA_API_KEY ?? "", "openwa-dashboard-v1", 32).toString("hex");
+    return secretMemo;
 }
 export function dashboardEnabled() {
     return Boolean(DASHBOARD_USERNAME && DASHBOARD_PASSWORD.length >= 8);
@@ -82,9 +90,15 @@ const WINDOW_MS = 15 * 60 * 1000;
 const LOCK_MS = 15 * 60 * 1000;
 const attempts = new Map();
 function clientIp(req) {
+    // SEC1/P1-1: the FIRST x-forwarded-for entry is client-spoofable
+    // (proven live on Render — rotating a forged first entry defeated the
+    // lockout). Render's edge APPENDS the real client IP, so the LAST
+    // entry is the one the trusted proxy observed. Non-proxied local
+    // traffic has no XFF at all and falls back to the socket address.
     const xf = req.header("x-forwarded-for") ?? "";
-    const first = xf.split(",")[0].trim();
-    return first || req.socket.remoteAddress || "unknown";
+    const parts = xf.split(",").map((x) => x.trim()).filter(Boolean);
+    const last = parts.length > 0 ? parts[parts.length - 1] : "";
+    return last || req.socket.remoteAddress || "unknown";
 }
 function isLocked(ip) {
     const rec = attempts.get(ip);

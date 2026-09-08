@@ -44,8 +44,18 @@ export function mountDashboard(app, deps) {
                 continue;
             const k = part.slice(0, eq).trim();
             const v = part.slice(eq + 1).trim();
-            if (k && v)
+            if (!k || !v)
+                continue;
+            // SEC1/P2-1: a malformed percent-escape (Cookie: x=%) crashed
+            // decodeURIComponent → 500 on EVERY route including the key-gated
+            // /api surface. Malformed values fall through raw — the signed
+            // token verification rejects them anyway.
+            try {
                 jar[k] = decodeURIComponent(v);
+            }
+            catch {
+                jar[k] = v;
+            }
         }
         req.cookies = jar;
         next();
