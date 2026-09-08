@@ -14,6 +14,10 @@
  *     POST /api/sessions/{id}/messages/send-text {chatId,text}
  *     GET  /api/sessions/{id}/contacts/check/{number} → {exists:boolean}
  *
+ * Operator dashboard (browser): GET / — username+password login
+ * (DASHBOARD_USERNAME / DASHBOARD_PASSWORD env), cookie-authenticated
+ * session management UI. Never exposes OPENWA_API_KEY to the browser.
+ *
  *   Lifecycle: created → initializing → qr_ready → authenticating →
  *              ready → (disconnected ⇄ reconnect) | failed
  *
@@ -39,6 +43,8 @@ import {
   listPersistedNames,
   deletePersisted,
 } from "./persist.js";
+import { mountDashboard, type DashboardSessionView } from "./dashboard-routes.js";
+import { dashboardEnabled } from "./dashboard.js";
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -320,7 +326,76 @@ app.use(express.json({ limit: "256kb" }));
 
 app.get("/healthz", (_req, res) => {
   const ready = [...sessions.values()].filter((s) => s.status === "ready").length;
-  res.json({ ok: true, sessions: sessions.size, ready });
+  res.json({ ok: true, sessions: sessions.size, ready, dashboard: dashboardEnabled() });
+});
+
+// ── Operator dashboard (browser UI) ───────────────────────────────────────────
+// Mounted BEFORE the /api key gate: it authenticates with its own signed
+// cookie, never with the API key, so the browser never learns it.
+const bootedAt = Date.now();
+
+function toDashboardView(rs: RuntimeSession): DashboardSessionView {
+  return {
+    id: rs.id,
+    name: rs.name,
+    status: rs.status,
+    createdAt: rs.createdAt,
+    lastReadyAt: rs.lastReadyAt,
+    lastDeliveryStatus: rs.lastDeliveryStatus,
+    async start() {
+      if (!rs.socket) {
+        rs.status = rs.status === "created" ? "initializing" : rs.status;
+        await startSession(rs);
+      }
+    },
+    async requestPairCode(phone: string) {
+      if (!rs.socket) throw new Error("session_not_started");
+      return rs.socket.requestPairingCode(phone);
+    },
+    qrString: () => rs.qrString ?? null,
+    async delete() {
+      rs.stopRequested = true;
+      try {
+        rs.socket?.end(undefined);
+      } catch {
+        // engine may already be dead
+      }
+      sessions.delete(rs.id);
+      await fs
+        .rm(`${DATA_DIR}/sessions/${rs.name}`, { recursive: true, force: true })
+        .catch(() => {});
+      deletePersisted(rs.name);
+      log.info({ sessionId: rs.id, name: rs.name }, "[session] deleted (dashboard)");
+    },
+  };
+}
+
+async function createSessionRecord(
+  name: string,
+): Promise<
+  | { id: string; name: string; status: string; createdAt: string }
+  | { error: string; conflict?: boolean }
+> {
+  if (findByName(name)) return { error: "يوجد جلسة بنفس الاسم بالفعل", conflict: true };
+  const rs: RuntimeSession = {
+    id: `sess_${nanoid(16)}`,
+    name,
+    status: "created",
+    createdAt: new Date().toISOString(),
+  };
+  sessions.set(rs.id, rs);
+  log.info({ sessionId: rs.id, name }, "[session] created (dashboard)");
+  return { id: rs.id, name: rs.name, status: rs.status, createdAt: rs.createdAt };
+}
+
+mountDashboard(app, {
+  sessions: () => [...sessions.values()].map(toDashboardView),
+  info: () => ({
+    uptimeSec: Math.floor((Date.now() - bootedAt) / 1000),
+    persist: persistenceEnabled(),
+    version: "1.2.0",
+  }),
+  createSession: createSessionRecord,
 });
 
 app.use("/api", (req, res, next) => {
@@ -356,18 +431,11 @@ app.post("/api/sessions", async (req, res) => {
   if (!SESSION_NAME_RE.test(name)) {
     return res.status(400).json({ error: "name must match [A-Za-z0-9-]{3,50}" });
   }
-  if (findByName(name)) {
-    return res.status(409).json({ error: "session name already exists" });
+  const created = await createSessionRecord(name);
+  if ("error" in created) {
+    return res.status(created.conflict ? 409 : 500).json({ error: created.error });
   }
-  const rs: RuntimeSession = {
-    id: `sess_${nanoid(16)}`,
-    name,
-    status: "created",
-    createdAt: new Date().toISOString(),
-  };
-  sessions.set(rs.id, rs);
-  log.info({ sessionId: rs.id, name }, "[session] created");
-  return res.status(201).json(publicView(rs));
+  return res.status(201).json(created);
 });
 
 // Get one session
