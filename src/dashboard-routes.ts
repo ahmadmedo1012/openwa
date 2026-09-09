@@ -39,6 +39,13 @@ export interface DashboardSessionView {
   createdAt: string;
   lastReadyAt?: string;
   lastDeliveryStatus?: string;
+  /** Linked-account identity (enriched view). هوية الحساب المرتبط. */
+  accountDigits?: string;
+  accountName?: string;
+  /** Timestamp of the CURRENT open. وقت الاتصال الحالي. */
+  connectedAt?: string;
+  /** ms since the last persisted snapshot (null = never). عمر آخر لقطة. */
+  persistAgeMs?: number;
   /** Runtime hooks provided by index.ts (structural, no import cycle). */
   start(): Promise<void>;
   requestPairCode(phone: string): Promise<string>;
@@ -159,6 +166,10 @@ export function mountDashboard(app: express.Express, deps: DashboardDeps): void 
       createdAt: jsonSafeDate(s.createdAt),
       lastReadyAt: s.lastReadyAt ? jsonSafeDate(s.lastReadyAt) : null,
       lastDeliveryStatus: s.lastDeliveryStatus ?? null,
+      accountDigits: s.accountDigits ?? null,
+      accountName: s.accountName ?? null,
+      connectedAt: s.connectedAt ? jsonSafeDate(s.connectedAt) : null,
+      persistAgeMs: s.persistAgeMs ?? null,
     }));
     json(res, 200, { sessions, info: deps.info() });
   }));

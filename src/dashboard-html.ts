@@ -242,6 +242,9 @@ const DELIVERY={'1':'قيد الإرسال','2':'وصلت للخادم','3':'ت�
 function fmtDate(iso){if(!iso)return '—';const d=new Date(iso);
   return d.toLocaleDateString('ar-LY',{day:'numeric',month:'short'})+' '+
   d.toLocaleTimeString('ar-LY',{hour:'2-digit',minute:'2-digit'})}
+// عمر آخر snapshot محفوظ — عرض مختصر بالعربية
+function fmtAge(ms){if(ms==null||isNaN(ms))return '—';const s=Math.max(0,Math.round(ms/1000));
+  if(s<60)return s+' ث';const m=Math.floor(s/60);if(m<60)return m+' د';return Math.floor(m/60)+' س'}
 
 async function api(path,opts){const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opts));
   let b=null;try{b=await r.json()}catch{}
@@ -275,7 +278,11 @@ function render(){
       (s.status==='ready')?'':'<button class="btn btn-ghost" data-a="pair" data-id="'+esc(s.id)+'">رمز ربط</button>',
       '<button class="btn btn-danger" data-a="del" data-id="'+esc(s.id)+'">حذف</button>',
     ].filter(Boolean).join('');
-    return '<tr><td><b>'+esc(s.name)+'</b><div class="mono" style="font-size:11px">'+esc(s.id)+'</div></td>'+
+    return '<tr><td><b>'+esc(s.name)+'</b><div class="mono" style="font-size:11px">'+esc(s.id)+'</div>'+
+    (s.accountDigits?'<div class="mono" style="font-size:11px;margin-top:2px">👤 '+esc(s.accountDigits)+
+      (s.accountName?' · '+esc(s.accountName):'')+
+      (s.persistAgeMs!=null?' · لقطة: '+fmtAge(s.persistAgeMs):'')+'</div>':'')+
+    '</td>'+
     '<td><span class="badge '+cls+'">'+esc(st)+'</span></td>'+
     '<td class="hidem mono">'+fmtDate(s.lastReadyAt)+'</td>'+
     '<td class="hidem">'+(s.lastDeliveryStatus?esc(DELIVERY[s.lastDeliveryStatus]||s.lastDeliveryStatus):'—')+'</td>'+

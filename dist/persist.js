@@ -52,9 +52,27 @@ async function ensurePool() {
 export function persistenceEnabled() {
     return Boolean(PERSISTENCE_URL && API_KEY);
 }
-/** Debounced save of one session's serialized auth state. */
+/** ms since the last SUCCESSFUL save of a session (null = never saved). */
+const lastSavedAt = new Map();
+/** Core save: serialize + encrypted upsert + bookkeeping. جوهر الحفظ. */
+async function doSave(name, serialize) {
+    const p = await ensurePool();
+    if (!p)
+        return;
+    const json = await serialize();
+    await p.query(`INSERT INTO openwa_sessions (name, creds, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (name) DO UPDATE SET creds = $2, updated_at = NOW()`, [name, encrypt(json)]);
+    lastSavedAt.set(name, Date.now());
+    log.info({ name }, "[persist] credentials saved");
+}
+/**
+ * Debounced save of one session's serialized auth state.
+ * `delayMs` is variable: signal-store write-through uses a fast 300ms,
+ * the legacy creds path keeps the relaxed 3s default.
+ */
 const pending = new Map();
-export function scheduleSave(name, serialize) {
+export function scheduleSave(name, serialize, delayMs = 3_000) {
     if (!persistenceEnabled())
         return;
     const existing = pending.get(name);
@@ -62,22 +80,40 @@ export function scheduleSave(name, serialize) {
         clearTimeout(existing);
     pending.set(name, setTimeout(() => {
         pending.delete(name);
-        void (async () => {
-            try {
-                const p = await ensurePool();
-                if (!p)
-                    return;
-                const json = await serialize();
-                await p.query(`INSERT INTO openwa_sessions (name, creds, updated_at)
-             VALUES ($1, $2, NOW())
-             ON CONFLICT (name) DO UPDATE SET creds = $2, updated_at = NOW()`, [name, encrypt(json)]);
-                log.info({ name }, "[persist] credentials saved");
-            }
-            catch (err) {
-                log.warn({ err, name }, "[persist] save failed");
-            }
-        })();
-    }, 3_000));
+        void doSave(name, serialize).catch((err) => {
+            log.warn({ err, name }, "[persist] save failed");
+        });
+    }, delayMs));
+}
+/**
+ * Cancel any pending debounce and persist immediately (awaited).
+ * Used by the SIGTERM/SIGINT shutdown flush and the disconnect path —
+ * a debounced save would die with the process.
+ * إلغاء الـ debounce المعلّق وتنفيذ الحفظ فورًا.
+ */
+export async function flushNow(name, serialize) {
+    if (!persistenceEnabled())
+        return;
+    const existing = pending.get(name);
+    if (existing) {
+        clearTimeout(existing);
+        pending.delete(name);
+    }
+    try {
+        await doSave(name, serialize);
+    }
+    catch (err) {
+        log.warn({ err, name }, "[persist] flush failed");
+    }
+}
+/**
+ * Milliseconds since the last SUCCESSFUL save of this session's snapshot,
+ * or null when it has never been saved (fresh pairing / persistence off).
+ * عمر آخر snapshot محفوظ بالمللي ثانية.
+ */
+export function persistAge(name) {
+    const t = lastSavedAt.get(name);
+    return t == null ? null : Date.now() - t;
 }
 /** Load + decrypt stored credentials JSON for a session name (or null). */
 export async function loadCreds(name) {

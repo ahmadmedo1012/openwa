@@ -11,8 +11,13 @@
  *     POST /api/sessions        {name}         → SessionRecord
  *     POST /api/sessions/{id}/start            → SessionRecord
  *     GET  /api/sessions/{id}/qr               → operator HTML page w/ QR
- *     POST /api/sessions/{id}/messages/send-text {chatId,text}
+ *     POST /api/sessions/{id}/messages/send-text {chatId,text} → {ok,messageId,selfSend}
+ *     POST /api/sessions/{id}/messages/test      {chatId}      → {ok,messageId,selfSend}
+ *     GET  /api/sessions/{id}/delivery-log                     → {deliveries:DeliveryLogEntry[]}
  *     GET  /api/sessions/{id}/contacts/check/{number} → {exists:boolean}
+ *
+ * Self-send (OTP to the linked account's own number) is detected and routed
+ * via the account's LID — the modern "Message yourself" path.
  *
  * Operator dashboard (browser): GET / — username+password login
  * (DASHBOARD_USERNAME / DASHBOARD_PASSWORD env), cookie-authenticated
@@ -31,13 +36,17 @@ import { nanoid } from "nanoid";
 import { timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { persistenceEnabled, scheduleSave, loadCreds, listPersistedNames, deletePersisted, } from "./persist.js";
+import { persistenceEnabled, scheduleSave, flushNow, persistAge, loadCreds, listPersistedNames, deletePersisted, } from "./persist.js";
+import { normalizeChatId, extractAccountDigits, extractLidDigits, resolveSendJid, mergeDeliveryTimeline, pushDeliveryLog, } from "./lib.js";
 import { mountDashboard } from "./dashboard-routes.js";
 import { dashboardEnabled } from "./dashboard.js";
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 const PORT = Number(process.env.PORT ?? 2785);
 const API_KEY = (process.env.OPENWA_API_KEY ?? "").trim();
 const DATA_DIR = (process.env.DATA_DIR ?? "/data").replace(/\/+$/, "");
+// Self-send LID routing (OTP to the operator's own number): on by default,
+// opt-out with OPENWA_SELF_SEND_LID=0. توجيه المحادثة الذاتية عبر LID.
+const SELF_SEND_LID_ENABLED = (process.env.OPENWA_SELF_SEND_LID ?? "").trim() !== "0";
 if (!API_KEY) {
     log.error("OPENWA_API_KEY is required — refusing to start (refusing an open relay)");
     process.exit(1);
@@ -45,20 +54,41 @@ if (!API_KEY) {
 const SESSION_NAME_RE = /^[A-Za-z0-9-]{3,50}$/;
 // ── Registry ─────────────────────────────────────────────────────────────────
 const sessions = new Map(); // by id
-function publicView(s) {
+function publicView(rs) {
+    const persistAgeMs = persistAge(rs.name);
     return {
-        id: s.id,
-        name: s.name,
-        status: s.status,
-        createdAt: s.createdAt,
-        ...(s.lastReadyAt ? { lastReadyAt: s.lastReadyAt } : {}),
-        ...(s.lastDeliveryStatus ? { lastDeliveryStatus: s.lastDeliveryStatus } : {}),
+        id: rs.id,
+        name: rs.name,
+        status: rs.status,
+        createdAt: rs.createdAt,
+        ...(rs.lastReadyAt ? { lastReadyAt: rs.lastReadyAt } : {}),
+        ...(rs.lastDeliveryStatus ? { lastDeliveryStatus: rs.lastDeliveryStatus } : {}),
+        ...(rs.accountDigits ? { accountDigits: rs.accountDigits } : {}),
+        ...(rs.accountName ? { accountName: rs.accountName } : {}),
+        ...(rs.connectedAt ? { connectedAt: rs.connectedAt } : {}),
+        ...(persistAgeMs != null ? { persistAgeMs } : {}),
     };
 }
 function findByName(name) {
     return [...sessions.values()].find((s) => s.name === name);
 }
 // ── Socket wiring ────────────────────────────────────────────────────────────
+/**
+ * Serializer builder shared by EVERY persistence path (debounced snapshot,
+ * signal-store write-through, SIGTERM flush): reads the session's whole auth
+ * folder into one JSON blob. بانٍ موحّد لدالة التسلسل لكل مسارات الحفظ.
+ */
+function buildSerializer(name) {
+    return async () => {
+        const dir = `${DATA_DIR}/sessions/${name}`;
+        const files = await fs.readdir(dir);
+        const out = {};
+        for (const f of files) {
+            out[f] = await fs.readFile(path.join(dir, f), "utf8");
+        }
+        return JSON.stringify(out);
+    };
+}
 async function startSession(rs) {
     rs.stopRequested = false;
     rs.qrString = undefined;
@@ -86,6 +116,34 @@ async function startSession(rs) {
         }
     }
     const { state, saveCreds } = await useMultiFileAuthState(`${DATA_DIR}/sessions/${rs.name}`);
+    // ── Write-through persistence ──────────────────────────────────────────
+    // Signal-store writes (sessions / pre-keys / sender-keys) rotate on every
+    // send & receipt; the old code persisted only on creds.update/send, so a
+    // restore brought back a STALE signal state → the phone rendered
+    // "Waiting for this message". Every keys mutation now schedules a fast
+    // (300ms) debounced snapshot. كل كتابة signal store تُطلق حفظًا سريعًا.
+    const serialize = buildSerializer(rs.name);
+    rs.persistSerialize = serialize;
+    rs.persistFlush = () => flushNow(rs.name, serialize);
+    const scheduleKeySave = () => {
+        // Only once the session has proven itself connected — interim pairing
+        // state must never reach the DB (same gate as creds.update below).
+        if (rs.lastReadyAt)
+            scheduleSave(rs.name, serialize, 300);
+    };
+    const origSet = state.keys.set.bind(state.keys);
+    state.keys.set = async (data) => {
+        await origSet(data);
+        scheduleKeySave();
+    };
+    const keysAsDel = state.keys;
+    if (typeof keysAsDel.del === "function") {
+        const origDel = keysAsDel.del.bind(state.keys);
+        keysAsDel.del = async (data) => {
+            await origDel(data);
+            scheduleKeySave();
+        };
+    }
     let version;
     try {
         const latest = await fetchLatestBaileysVersion();
@@ -112,37 +170,61 @@ async function startSession(rs) {
     const persistSnapshot = () => {
         if (!persistenceEnabled() || !rs.lastReadyAt)
             return;
-        scheduleSave(rs.name, async () => {
-            const dir = `${DATA_DIR}/sessions/${rs.name}`;
-            const files = await fs.readdir(dir);
-            const out = {};
-            for (const f of files) {
-                out[f] = await fs.readFile(path.join(dir, f), "utf8");
-            }
-            return JSON.stringify(out);
-        });
+        scheduleSave(rs.name, serialize);
     };
     rs.persistSnapshot = persistSnapshot;
-    // Outbound delivery tracking: WhatsApp acks our sent messages through
-    // messages.update (PENDING → SERVER_ACK → DELIVERED/READ, or ERROR).
-    // Without this, an undecryptable/stuck message looked identical to a
-    // delivered one from the API's perspective.
+    // messages.upsert is now ONLY a persistence trigger — the old
+    // lastOutMsgId capture was broken: messages typed on the operator's OWN
+    // phone are also fromMe, so they polluted outbound tracking and made
+    // lastDeliveryStatus untrustworthy. التقاط lastOutMsgId المعطوب أُزيل.
     sock.ev.on("messages.upsert", (upsert) => {
         if (upsert.type !== "notify")
             return;
-        for (const m of upsert.messages) {
-            if (m.key.fromMe && typeof m.key.id === "string")
-                rs.lastOutMsgId = m.key.id;
-        }
+        // Incoming traffic advances app-state/signal material — refresh the
+        // snapshot fast so restores stay decryptable. الرسائل الواردة تحفظ.
+        scheduleKeySave();
     });
+    // Outbound delivery tracking: WhatsApp acks ENGINE-sent messages through
+    // messages.update (PENDING → SERVER_ACK → DELIVERED/READ, or ERROR).
+    // u.key.id is matched against the per-message delivery log — never
+    // against whatever fromMe message happened to arrive last, so the
+    // operator's own phone traffic can no longer fake a delivery status.
+    // تتبع تسليم صحيح: مطابقة معرف رسالة أرسلها المحرك نفسه فقط.
     sock.ev.on("messages.update", (updates) => {
         for (const u of updates) {
-            if (u.key.id && u.key.id === rs.lastOutMsgId && u.update?.status != null) {
-                const prev = rs.lastDeliveryStatus;
-                rs.lastDeliveryStatus = String(u.update.status);
-                if (prev !== rs.lastDeliveryStatus) {
-                    log.info({ sessionId: rs.id, status: rs.lastDeliveryStatus }, "[delivery] status");
+            const msgId = typeof u.key.id === "string" ? u.key.id : null;
+            const rawStatus = u.update?.status;
+            if (msgId == null || rawStatus == null)
+                continue;
+            const logArr = rs.deliveryLog;
+            if (!logArr || logArr.length === 0)
+                continue;
+            const newStatus = String(rawStatus);
+            for (let i = logArr.length - 1; i >= 0; i--) {
+                if (logArr[i].messageId !== msgId)
+                    continue;
+                const entry = logArr[i];
+                const nextEntry = {
+                    ...entry,
+                    timeline: mergeDeliveryTimeline(entry.timeline, newStatus),
+                    lastStatus: newStatus,
+                    lastStatusAt: new Date().toISOString(),
+                };
+                const next = [...logArr];
+                next[i] = nextEntry;
+                rs.deliveryLog = next;
+                if (i === next.length - 1) {
+                    // Legacy contract: lastDeliveryStatus = status of the last
+                    // message the ENGINE sent — not the operator's phone traffic.
+                    if (rs.lastDeliveryStatus !== newStatus) {
+                        rs.lastDeliveryStatus = newStatus;
+                        log.info({ sessionId: rs.id, messageId: msgId, status: newStatus }, "[delivery] status");
+                    }
                 }
+                else {
+                    log.info({ sessionId: rs.id, messageId: msgId, status: newStatus }, "[delivery] status (older message)");
+                }
+                break;
             }
         }
     });
@@ -174,7 +256,20 @@ async function startSession(rs) {
             rs.status = "ready";
             rs.qrString = undefined;
             rs.lastReadyAt = new Date().toISOString();
-            log.info({ sessionId: rs.id, name: rs.name }, "[session] connected (ready)");
+            rs.connectedAt = rs.lastReadyAt;
+            // Capture the linked-account identity for self-send detection +
+            // enriched views. التقاط هوية الحساب المرتبط (رقم/اسم/LID).
+            const me = sock.authState.creds.me;
+            rs.accountDigits = me?.id ? (extractAccountDigits(me.id) ?? undefined) : undefined;
+            rs.accountName = me?.name;
+            rs.accountLidDigits = me?.lid ? (extractLidDigits(me.lid) ?? undefined) : undefined;
+            log.info({
+                sessionId: rs.id,
+                name: rs.name,
+                accountDigits: rs.accountDigits ?? null,
+                accountName: rs.accountName ?? null,
+                accountLidDigits: rs.accountLidDigits ?? null,
+            }, "[session] connected (ready)");
             return;
         }
         if (connection === "close") {
@@ -203,6 +298,12 @@ async function startSession(rs) {
             rs.status = "disconnected";
             rs.socket = undefined;
             log.info({ sessionId: rs.id, name: rs.name, code }, "[session] disconnected — will restart on demand");
+            // Snapshot NOW, not debounced-then-dead: if the process dies inside
+            // the 5s reconnect window, the next boot must restore the LATEST
+            // signal state, not the pre-disconnect one.
+            // حفظ فوري قبل نافذة إعادة الاتصال.
+            if (rs.lastReadyAt)
+                void flushNow(rs.name, serialize);
             // Auto-reconnect with backoff unless explicitly stopped.
             setTimeout(() => {
                 const cur = sessions.get(rs.id);
@@ -246,11 +347,6 @@ function requireKey(req, res) {
         return false;
     }
     return true;
-}
-/** `218913456789@c.us` | `218913456789@s.whatsapp.net` | bare digits → normalized JID. */
-function normalizeChatId(raw) {
-    const digits = raw.replace(/[^0-9]/g, "");
-    return digits.length >= 8 && digits.length <= 15 ? `${digits}@s.whatsapp.net` : null;
 }
 function findOr404(id, res) {
     const rs = sessions.get(id);
@@ -296,6 +392,10 @@ function toDashboardView(rs) {
         createdAt: rs.createdAt,
         lastReadyAt: rs.lastReadyAt,
         lastDeliveryStatus: rs.lastDeliveryStatus,
+        accountDigits: rs.accountDigits,
+        accountName: rs.accountName,
+        connectedAt: rs.connectedAt,
+        persistAgeMs: persistAge(rs.name) ?? undefined,
         async start() {
             if (!rs.socket) {
                 rs.status = rs.status === "created" ? "initializing" : rs.status;
@@ -387,7 +487,9 @@ app.get("/api/docs", (_req, res) => {
             "POST   /api/sessions/{id}/start",
             "POST   /api/sessions/{id}/pair-code  body: {phone}",
             "GET    /api/sessions/{id}/qr        (operator: scan with WhatsApp)",
-            "POST   /api/sessions/{id}/messages/send-text   body: {chatId,text}",
+            "POST   /api/sessions/{id}/messages/send-text   body: {chatId,text} → {ok,messageId,selfSend}",
+            "POST   /api/sessions/{id}/messages/test        body: {chatId} → {ok,messageId,selfSend}",
+            "GET    /api/sessions/{id}/delivery-log",
             "GET    /api/sessions/{id}/contacts/check/{number}",
         ],
         auth: "X-API-Key header",
@@ -525,6 +627,78 @@ app.delete("/api/sessions/:id", async (req, res) => {
     log.info({ sessionId: rs.id, name: rs.name }, "[session] deleted");
     return res.json({ deleted: true, id: rs.id });
 });
+/**
+ * Shared send path for send-text + test: validates input, detects self-send
+ * (target digits === linked account digits) and routes the modern self-chat
+ * via the account's LID — falling back to the plain PN JID when the LID form
+ * fails. The REAL messageId from the engine's own sendMessage is recorded in
+ * the delivery log so later acks are matched per message.
+ * مسار الإرسال الموحّد — كشف self-send وتوجيه LID مع تسجيل معرف فعلي.
+ */
+async function engineSend(rs, chatIdRaw, text) {
+    const sock = rs.socket;
+    if (!sock || rs.status !== "ready") {
+        return { ok: false, code: 409, error: "session_not_ready" };
+    }
+    const pnJid = normalizeChatId(chatIdRaw);
+    if (!pnJid || !text || text.length > 4096) {
+        return { ok: false, code: 400, error: "invalid chatId/text" };
+    }
+    const targetDigits = pnJid.slice(0, pnJid.indexOf("@"));
+    const route = resolveSendJid(targetDigits, rs.accountDigits, rs.accountLidDigits, SELF_SEND_LID_ENABLED);
+    if (route.viaLid) {
+        log.info({ sessionId: rs.id, accountDigits: rs.accountDigits, lid: rs.accountLidDigits }, "[send] self-send detected — routing via LID (مسار المحادثة الذاتية)");
+    }
+    let messageId = null;
+    let usedJid = route.jid;
+    try {
+        const msg = await sock.sendMessage(route.jid, { text });
+        const id = msg?.key?.id;
+        messageId = typeof id === "string" ? id : null;
+    }
+    catch (err) {
+        if (!route.viaLid) {
+            log.error({ err, sessionId: rs.id, chatId: targetDigits }, "[send] failed");
+            return { ok: false, code: 500, error: "send_failed" };
+        }
+        // LID self-send rejected — retry the legacy PN form before giving up.
+        // فشل الإرسال بصيغة LID: إعادة المحاولة بصيغة رقم الهاتف الأصلية.
+        log.warn({ err, sessionId: rs.id }, "[send] LID self-send failed — retrying via PN jid");
+        try {
+            const msg = await sock.sendMessage(route.pnJid, { text });
+            const id = msg?.key?.id;
+            messageId = typeof id === "string" ? id : null;
+            usedJid = route.pnJid;
+        }
+        catch (err2) {
+            log.error({ err: err2, sessionId: rs.id, chatId: targetDigits }, "[send] PN retry failed too");
+            return { ok: false, code: 500, error: "send_failed" };
+        }
+    }
+    // Track the messageId the ENGINE generated — acks in messages.update are
+    // matched against this, never against arbitrary fromMe traffic.
+    // تسجيل معرف الرسالة الفعلي في سجل التسليم (حلقة بحد 25).
+    if (messageId) {
+        rs.deliveryLog = pushDeliveryLog(rs.deliveryLog ?? [], {
+            messageId,
+            chatId: usedJid,
+            sentAt: new Date().toISOString(),
+            timeline: [],
+        });
+    }
+    log.info({
+        sessionId: rs.id,
+        chatId: usedJid,
+        selfSend: route.selfSend,
+        viaLid: usedJid !== route.pnJid,
+        messageId,
+    }, "[send] delivered to engine");
+    // Sending rotates sender-key material server-side; refreshing the
+    // persisted snapshot here keeps restores decryptable (a stale snapshot
+    // produced 'waiting for this message' after boot self-heal).
+    rs.persistSnapshot?.();
+    return { ok: true, messageId, selfSend: route.selfSend };
+}
 // Send text
 app.post("/api/sessions/:id/messages/send-text", async (req, res) => {
     const rs = findOr404(req.params.id, res);
@@ -533,25 +707,42 @@ app.post("/api/sessions/:id/messages/send-text", async (req, res) => {
     if (!rs.socket || rs.status !== "ready") {
         return res.status(409).json({ error: "session_not_ready", status: rs.status });
     }
-    const chatIdRaw = String(req.body?.chatId ?? "");
-    const text = String(req.body?.text ?? "");
-    const jid = normalizeChatId(chatIdRaw);
-    if (!jid || !text || text.length > 4096) {
-        return res.status(400).json({ error: "invalid chatId/text" });
+    const out = await engineSend(rs, String(req.body?.chatId ?? ""), String(req.body?.text ?? ""));
+    if (!out.ok) {
+        return res.status(out.code).json({ error: out.error });
     }
-    try {
-        await rs.socket.sendMessage(jid, { text });
-        log.info({ sessionId: rs.id, chatId: jid.slice(0, jid.indexOf("@")) + "@…" }, "[send-text] delivered to engine");
-        // Sending rotates sender-key material server-side; refreshing the
-        // persisted snapshot here keeps restores decryptable (a stale snapshot
-        // produced 'waiting for this message' after boot self-heal).
-        rs.persistSnapshot?.();
-        return res.json({ ok: true, delivery: rs.lastDeliveryStatus ?? "pending" });
+    return res.json({
+        ok: true,
+        messageId: out.messageId,
+        selfSend: out.selfSend,
+        delivery: rs.lastDeliveryStatus ?? "pending",
+    });
+});
+// Live channel test: fixed text through the exact send-text logic (incl.
+// self-send LID routing) and recorded in the delivery log.
+// اختبار حي لقناة واتساب برسالة ثابتة — للتحقق من وصول الرسائل فعليًا.
+const TEST_MESSAGE_TEXT = "🔧 رسالة اختبار من نظام SubNation — إن وصلتك هذه الرسالة فقناة واتساب تعمل بشكل سليم";
+app.post("/api/sessions/:id/messages/test", async (req, res) => {
+    const rs = findOr404(req.params.id, res);
+    if (!rs)
+        return;
+    if (!rs.socket || rs.status !== "ready") {
+        return res.status(409).json({ error: "session_not_ready", status: rs.status });
     }
-    catch (err) {
-        log.error({ err, sessionId: rs.id }, "[send-text] failed");
-        return res.status(500).json({ error: "send_failed" });
+    const out = await engineSend(rs, String(req.body?.chatId ?? ""), TEST_MESSAGE_TEXT);
+    if (!out.ok) {
+        return res.status(out.code).json({ error: out.error });
     }
+    return res.json({ ok: true, messageId: out.messageId, selfSend: out.selfSend });
+});
+// Outbound delivery log (ENGINE-sent messages only) — the OTP backend polls
+// this to verify an OTP actually reached the device instead of guessing.
+// سجل تسليم الرسائل الصادرة من المحرك فقط (حتى 25 رسالة).
+app.get("/api/sessions/:id/delivery-log", (req, res) => {
+    const rs = findOr404(req.params.id, res);
+    if (!rs)
+        return;
+    return res.json({ deliveries: rs.deliveryLog ?? [] });
 });
 // JSON 404 for anything else under /api
 app.use("/api", (_req, res) => res.status(404).json({ error: "not found" }));
@@ -605,3 +796,31 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
     log.error({ reason: String(reason) }, "[process] unhandledRejection — keeping the process alive");
 });
+// ── Graceful shutdown: final persistence flush ────────────────────────────
+// Render sends SIGTERM before killing the instance (deploy / spin-down).
+// Pending debounced saves (300ms / 3s) would die with the process, so the
+// next boot would restore a STALE snapshot → decryption failures on the
+// phone ("Waiting for this message"). Flush every ready session now,
+// bounded by a 4s total budget, then exit cleanly.
+// تدفّق نهائي عند الإيقاف: حفظ كل جلسة جاهزة قبل الخروج.
+let isShuttingDown = false;
+const SHUTDOWN_FLUSH_BUDGET_MS = 4_000;
+async function shutdownFlush(signal) {
+    if (isShuttingDown)
+        return; // a second signal must never double-flush
+    isShuttingDown = true;
+    const ready = [...sessions.values()].filter((s) => s.status === "ready" && s.persistFlush);
+    log.info({ signal, sessions: ready.length, budgetMs: SHUTDOWN_FLUSH_BUDGET_MS }, "[shutdown] flushing persisted credentials before exit");
+    const flushes = ready.map((s) => s.persistFlush());
+    const budget = new Promise((resolve) => setTimeout(resolve, SHUTDOWN_FLUSH_BUDGET_MS));
+    try {
+        await Promise.race([Promise.all(flushes), budget]);
+    }
+    catch (err) {
+        log.warn({ err }, "[shutdown] flush error — exiting anyway");
+    }
+    log.info({ signal }, "[shutdown] flush complete — exiting");
+    process.exit(0);
+}
+process.on("SIGTERM", () => void shutdownFlush("SIGTERM"));
+process.on("SIGINT", () => void shutdownFlush("SIGINT"));

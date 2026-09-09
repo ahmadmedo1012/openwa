@@ -110,6 +110,10 @@ export function mountDashboard(app, deps) {
             createdAt: jsonSafeDate(s.createdAt),
             lastReadyAt: s.lastReadyAt ? jsonSafeDate(s.lastReadyAt) : null,
             lastDeliveryStatus: s.lastDeliveryStatus ?? null,
+            accountDigits: s.accountDigits ?? null,
+            accountName: s.accountName ?? null,
+            connectedAt: s.connectedAt ? jsonSafeDate(s.connectedAt) : null,
+            persistAgeMs: s.persistAgeMs ?? null,
         }));
         json(res, 200, { sessions, info: deps.info() });
     }));
