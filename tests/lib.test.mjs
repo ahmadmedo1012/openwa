@@ -17,7 +17,10 @@ import {
   mergeDeliveryTimeline,
   pushDeliveryLog,
   chatDigits,
+  deliveryStatusRank,
+  advanceDeliveryStatus,
   DELIVERY_LOG_CAP,
+  DELIVERY_TIMELINE_CAP,
 } from "../dist/lib.js";
 
 // ── normalizeChatId ──────────────────────────────────────────────────────────
@@ -110,6 +113,47 @@ test("resolveSendJid: no linked account identity on file → plain PN route", ()
   assert.equal(r.viaLid, false);
 });
 
+// ── delivery status semantics (WA-04) ────────────────────────────────────────
+
+test("deliveryStatusRank: WAProto WebMessageInfo.Status ranks 0–5", () => {
+  // ERROR=0, PENDING=1, SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5
+  assert.equal(deliveryStatusRank("0"), 0);
+  assert.equal(deliveryStatusRank("1"), 1);
+  assert.equal(deliveryStatusRank("2"), 2);
+  assert.equal(deliveryStatusRank("3"), 3);
+  assert.equal(deliveryStatusRank("4"), 4);
+  assert.equal(deliveryStatusRank("5"), 5);
+});
+
+test("deliveryStatusRank: non-numeric / negative / fractional → -1", () => {
+  assert.equal(deliveryStatusRank("abc"), -1);
+  assert.equal(deliveryStatusRank(""), -1);
+  assert.equal(deliveryStatusRank("-1"), -1);
+  assert.equal(deliveryStatusRank("2.5"), -1);
+});
+
+test("advanceDeliveryStatus: undefined current adopts the next status", () => {
+  assert.equal(advanceDeliveryStatus(undefined, "2"), "2");
+});
+
+test("advanceDeliveryStatus: forward progression is adopted", () => {
+  assert.equal(advanceDeliveryStatus("2", "3"), "3");
+  assert.equal(advanceDeliveryStatus("3", "4"), "4");
+});
+
+test("advanceDeliveryStatus: a REGRESSION never lowers the max (the live 3→2 WA-04 incident)", () => {
+  assert.equal(advanceDeliveryStatus("3", "2"), "3");
+  assert.equal(advanceDeliveryStatus("4", "2"), "4");
+  assert.equal(advanceDeliveryStatus("3", "0"), "3");
+});
+
+test("advanceDeliveryStatus: unrankable next never displaces a ranked current", () => {
+  assert.equal(advanceDeliveryStatus("2", "weird"), "2");
+  // first observation of something unrankable still lands when current is absent
+  assert.equal(advanceDeliveryStatus(undefined, "weird"), "weird");
+  assert.equal(advanceDeliveryStatus("weird", "3"), "3"); // ranked beats unrankable
+});
+
 // ── mergeDeliveryTimeline ────────────────────────────────────────────────────
 
 test("mergeDeliveryTimeline: appends a new status with its timestamp", () => {
@@ -137,6 +181,16 @@ test("mergeDeliveryTimeline: never mutates the input array", () => {
   assert.equal(t0.length, 1);
 });
 
+test("mergeDeliveryTimeline (WA-04): caps the timeline at the LAST 10 transitions", () => {
+  assert.equal(DELIVERY_TIMELINE_CAP, 10);
+  let t = [];
+  // alternating statuses dodge the consecutive-duplicate collapse
+  for (let i = 1; i <= 12; i++) t = mergeDeliveryTimeline(t, i % 2 === 0 ? "2" : "3", `t${i}`);
+  assert.equal(t.length, DELIVERY_TIMELINE_CAP);
+  // the first two transitions (t1, t2) were dropped — oldest evicted
+  assert.deepEqual(t.map((e) => e.at), ["t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11", "t12"]);
+});
+
 // ── pushDeliveryLog ──────────────────────────────────────────────────────────
 
 const entry = (i) => ({
@@ -151,12 +205,13 @@ test("pushDeliveryLog: appends and preserves order", () => {
   assert.deepEqual(out.map((e) => e.messageId), ["msg-1", "msg-2"]);
 });
 
-test("pushDeliveryLog: evicts the OLDEST entries past the cap (ring buffer)", () => {
+test("pushDeliveryLog: evicts the OLDEST entries past the cap (ring buffer, WA-04: cap 500)", () => {
+  assert.equal(DELIVERY_LOG_CAP, 500);
   let log = [];
-  for (let i = 1; i <= 30; i++) log = pushDeliveryLog(log, entry(i));
+  for (let i = 1; i <= DELIVERY_LOG_CAP + 5; i++) log = pushDeliveryLog(log, entry(i));
   assert.equal(log.length, DELIVERY_LOG_CAP);
   assert.equal(log[0].messageId, "msg-6"); // 1..5 evicted
-  assert.equal(log[log.length - 1].messageId, "msg-30");
+  assert.equal(log[log.length - 1].messageId, `msg-${DELIVERY_LOG_CAP + 5}`);
 });
 
 test("pushDeliveryLog: honors a custom cap", () => {

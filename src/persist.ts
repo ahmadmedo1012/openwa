@@ -63,11 +63,29 @@ export function persistenceEnabled(): boolean {
 /** ms since the last SUCCESSFUL save of a session (null = never saved). */
 const lastSavedAt = new Map<string, number>();
 
+/**
+ * WA-02 resurrection guard: timestamp of the LAST credentials wipe per
+ * session name. A save that STARTED before a wipe (pending debounce or
+ * an in-flight flushNow) must never upsert AFTER it — the async wipe and
+ * a slow save can otherwise land out of order and resurrect dead creds
+ * in the DB. Timestamp comparison (>= start-of-save) keeps a legitimate
+ * save from a LATER re-pair working untouched.
+ * شاهد قبر يمنع إنعاش بيانات اعتماد ميتة بعد المسح.
+ */
+const wipedAt = new Map<string, number>();
+
 /** Core save: serialize + encrypted upsert + bookkeeping. جوهر الحفظ. */
 async function doSave(name: string, serialize: () => Promise<string>): Promise<void> {
   const p = await ensurePool();
   if (!p) return;
+  const startedAt = Date.now();
+  // Guard (pre-serialize): a wipe that already landed kills this save.
+  const wipe1 = wipedAt.get(name);
+  if (wipe1 != null && wipe1 >= startedAt) return;
   const json = await serialize();
+  // Guard (post-serialize): the folder read above may have raced a wipe.
+  const wipe2 = wipedAt.get(name);
+  if (wipe2 != null && wipe2 >= startedAt) return;
   await p.query(
     `INSERT INTO openwa_sessions (name, creds, updated_at)
      VALUES ($1, $2, NOW())
@@ -102,6 +120,21 @@ export function scheduleSave(
       });
     }, delayMs),
   );
+}
+
+/**
+ * Cancel a pending debounced save WITHOUT writing anything (WA-02).
+ * Called when credentials are being wiped: a stale timer firing after
+ * the wipe would serialize the (possibly still-present) folder and
+ * upsert the dead blob back into the DB.
+ * إلغاء الحفظ المؤجل المعلّق دون أي كتابة.
+ */
+export function cancelPendingSave(name: string): void {
+  const existing = pending.get(name);
+  if (existing) {
+    clearTimeout(existing);
+    pending.delete(name);
+  }
 }
 
 /**
@@ -161,14 +194,22 @@ export async function listPersistedNames(): Promise<string[]> {
   }
 }
 
-export function deletePersisted(name: string): void {
-  void (async () => {
-    try {
-      const p = await ensurePool();
-      if (!p) return;
-      await p.query(`DELETE FROM openwa_sessions WHERE name = $1`, [name]);
-    } catch {
-      // best-effort
-    }
-  })();
+/**
+ * Wipe the persisted credentials blob for a session (the local auth dir
+ * is the caller's job). WA-02 hardening: cancels any pending debounced
+ * save, tombstones the name (an in-flight save that started earlier can
+ * never upsert the dead blob afterwards) and drops the persistAge marker.
+ * مسح البيانات المحفوظة مع إلغاء أي حفظ معلّق وشاهد قبر يمنع الإنعاش.
+ */
+export async function deletePersisted(name: string): Promise<void> {
+  cancelPendingSave(name);
+  wipedAt.set(name, Date.now());
+  lastSavedAt.delete(name);
+  try {
+    const p = await ensurePool();
+    if (!p) return;
+    await p.query(`DELETE FROM openwa_sessions WHERE name = $1`, [name]);
+  } catch {
+    // best-effort
+  }
 }

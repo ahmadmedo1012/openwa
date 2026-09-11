@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "test": "npm run build && node --test tests/lib.test.mjs tests/rate-limit.test.mjs tests/logged-out-reset.test.mjs"
   },
   "engines": {
     "node": ">=20"

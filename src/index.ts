@@ -19,6 +19,13 @@
  * Self-send (OTP to the linked account's own number) is detected and routed
  * via the account's LID — the modern "Message yourself" path.
  *
+ * Rate limits (R97-04 partial, in-memory sliding window per IP):
+ *     /api/sessions/{id}/pair-code                → 5 / hour
+ *     /api/sessions/{id}/messages/send-text|test  → 60 / minute
+ *     every other /api request (GET included)      → 240 / minute
+ *   429 {error:"rate_limited",retry_after_sec} + Retry-After header;
+ *   /healthz is outside /api and never throttled. See src/rate-limit.ts.
+ *
  * Operator dashboard (browser): GET / — username+password login
  * (DASHBOARD_USERNAME / DASHBOARD_PASSWORD env), cookie-authenticated
  * session management UI. Never exposes OPENWA_API_KEY to the browser.
@@ -52,6 +59,7 @@ import {
   loadCreds,
   listPersistedNames,
   deletePersisted,
+  cancelPendingSave,
 } from "./persist.js";
 import {
   normalizeChatId,
@@ -60,8 +68,11 @@ import {
   resolveSendJid,
   mergeDeliveryTimeline,
   pushDeliveryLog,
+  advanceDeliveryStatus,
+  applyConnectionClose,
   type DeliveryLogEntry,
 } from "./lib.js";
+import { createApiRateLimiter } from "./rate-limit.js";
 import { mountDashboard, type DashboardSessionView } from "./dashboard-routes.js";
 import { dashboardEnabled } from "./dashboard.js";
 
@@ -279,6 +290,13 @@ async function startSession(rs: RuntimeSession): Promise<void> {
   // against whatever fromMe message happened to arrive last, so the
   // operator's own phone traffic can no longer fake a delivery status.
   // تتبع تسليم صحيح: مطابقة معرف رسالة أرسلها المحرك نفسه فقط.
+  //
+  // WA-04: WhatsApp statuses can REGRESS (a live 3→2 re-ack burst was
+  // observed at the exact second a pairing was revoked). Every
+  // transition is recorded in the timeline (audit), but the
+  // authoritative status — per entry AND on the session view — is the
+  // MAX rank ever observed, never the raw last event.
+  // الحالة الموثوقة = الأعلى رتبةً — الانحدار يُسجَّل ولا يُعتمد.
   sock.ev.on("messages.update", (updates) => {
     for (const u of updates) {
       const msgId = typeof u.key.id === "string" ? u.key.id : null;
@@ -290,29 +308,35 @@ async function startSession(rs: RuntimeSession): Promise<void> {
       for (let i = logArr.length - 1; i >= 0; i--) {
         if (logArr[i].messageId !== msgId) continue;
         const entry = logArr[i];
+        const prevMax = entry.maxStatus ?? entry.lastStatus;
+        const nextMax = advanceDeliveryStatus(prevMax, newStatus);
+        const advanced = nextMax !== prevMax;
         const nextEntry: DeliveryLogEntry = {
           ...entry,
           timeline: mergeDeliveryTimeline(entry.timeline, newStatus),
-          lastStatus: newStatus,
-          lastStatusAt: new Date().toISOString(),
+          lastStatus: nextMax,
+          maxStatus: nextMax,
+          // lastStatusAt tracks when the authoritative status last
+          // ADVANCED — a regression keeps its own timeline timestamp.
+          ...(advanced || !entry.lastStatusAt ? { lastStatusAt: new Date().toISOString() } : {}),
         };
         const next = [...logArr];
         next[i] = nextEntry;
         rs.deliveryLog = next;
-        if (i === next.length - 1) {
-          // Legacy contract: lastDeliveryStatus = status of the last
-          // message the ENGINE sent — not the operator's phone traffic.
-          if (rs.lastDeliveryStatus !== newStatus) {
-            rs.lastDeliveryStatus = newStatus;
-            log.info(
-              { sessionId: rs.id, messageId: msgId, status: newStatus },
-              "[delivery] status",
-            );
-          }
+        // Session-level status: the MAX seen across engine-sent messages
+        // (legacy "last message only" contract replaced — an older
+        // message's ack is still real evidence of delivery capability).
+        const before = rs.lastDeliveryStatus;
+        rs.lastDeliveryStatus = advanceDeliveryStatus(before, newStatus);
+        if (rs.lastDeliveryStatus !== before) {
+          log.info(
+            { sessionId: rs.id, messageId: msgId, status: rs.lastDeliveryStatus },
+            "[delivery] status",
+          );
         } else {
           log.info(
             { sessionId: rs.id, messageId: msgId, status: newStatus },
-            "[delivery] status (older message)",
+            "[delivery] status (regression recorded, max kept)",
           );
         }
         break;
@@ -376,43 +400,58 @@ async function startSession(rs: RuntimeSession): Promise<void> {
         ?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
 
-      if (loggedOut || rs.stopRequested) {
-        // Pairing revoked (device logged out elsewhere) — credentials are
-        // dead. Wipe LOCAL dir AND the persisted blob, otherwise every boot
-        // resurrected dead creds into the same failed loop.
-        rs.status = "failed";
-        rs.socket = undefined;
-        void (async () => {
-          try {
-            await fs.rm(`${DATA_DIR}/sessions/${rs.name}`, { recursive: true, force: true });
-            const { deletePersisted } = await import("./persist.js");
-            deletePersisted(rs.name);
-            log.warn({ sessionId: rs.id, name: rs.name }, "[session] dead credentials wiped (local+persistence)");
-          } catch {}
-        })();
+      const outcome = applyConnectionClose(
+        rs,
+        { loggedOut, stopRequested: Boolean(rs.stopRequested) },
+        {
+          // WA-02: dead credentials must never be resurrected. Cancel any
+          // pending debounced save FIRST (a stale timer firing after the
+          // wipe would upsert the dead blob back into the DB), then wipe
+          // the local dir, then the persisted blob — deletePersisted
+          // re-cancels and tombstones the name so even an in-flight
+          // flushNow that started earlier cannot land after the wipe.
+          // إبطال بيانات ميتة بلا إنعاش: إلغاء الحفظ المعلّق أولًا ثم المسح.
+          wipeCredentials: () => {
+            void (async () => {
+              try {
+                cancelPendingSave(rs.name);
+                await fs.rm(`${DATA_DIR}/sessions/${rs.name}`, { recursive: true, force: true });
+                await deletePersisted(rs.name);
+                log.warn(
+                  { sessionId: rs.id, name: rs.name },
+                  "[session] dead credentials wiped (local+persistence)",
+                );
+              } catch {}
+            })();
+          },
+          markRestartable: () => void restartable(rs),
+          // Snapshot NOW, not debounced-then-dead: if the process dies
+          // inside the 5s reconnect window, the next boot must restore
+          // the LATEST signal state, not the pre-disconnect one.
+          // حفظ فوري قبل نافذة إعادة الاتصال.
+          flushSnapshot: () => void flushNow(rs.name, serialize),
+          // Auto-reconnect with backoff unless explicitly stopped.
+          scheduleReconnect: () => {
+            setTimeout(() => {
+              const cur = sessions.get(rs.id);
+              if (cur && !cur.stopRequested && cur.status === "disconnected") {
+                cur.status = "initializing";
+                void startSession(cur).catch((err) =>
+                  log.error({ err, sessionId: rs.id }, "[session] reconnect failed"),
+                );
+              }
+            }, 5_000);
+          },
+        },
+      );
+      if (outcome === "failed") {
         log.warn({ sessionId: rs.id, name: rs.name, loggedOut }, "[session] closed permanently");
-        void restartable(rs);
-        return;
+      } else {
+        log.info(
+          { sessionId: rs.id, name: rs.name, code },
+          "[session] disconnected — will restart on demand",
+        );
       }
-
-      rs.status = "disconnected";
-      rs.socket = undefined;
-      log.info({ sessionId: rs.id, name: rs.name, code }, "[session] disconnected — will restart on demand");
-      // Snapshot NOW, not debounced-then-dead: if the process dies inside
-      // the 5s reconnect window, the next boot must restore the LATEST
-      // signal state, not the pre-disconnect one.
-      // حفظ فوري قبل نافذة إعادة الاتصال.
-      if (rs.lastReadyAt) void flushNow(rs.name, serialize);
-      // Auto-reconnect with backoff unless explicitly stopped.
-      setTimeout(() => {
-        const cur = sessions.get(rs.id);
-        if (cur && !cur.stopRequested && cur.status === "disconnected") {
-          cur.status = "initializing";
-          void startSession(cur).catch((err) =>
-            log.error({ err, sessionId: rs.id }, "[session] reconnect failed"),
-          );
-        }
-      }, 5_000);
     }
   });
 }
@@ -528,7 +567,7 @@ function toDashboardView(rs: RuntimeSession): DashboardSessionView {
       await fs
         .rm(`${DATA_DIR}/sessions/${rs.name}`, { recursive: true, force: true })
         .catch(() => {});
-      deletePersisted(rs.name);
+      await deletePersisted(rs.name);
       log.info({ sessionId: rs.id, name: rs.name }, "[session] deleted (dashboard)");
     },
   };
@@ -580,10 +619,17 @@ mountDashboard(app, {
   info: () => ({
     uptimeSec: Math.floor((Date.now() - bootedAt) / 1000),
     persist: persistenceEnabled(),
-    version: "1.2.0",
+    version: "1.3.0",
   }),
   createSession: createSessionRecord,
 });
+
+// R97-04 (partial): in-memory sliding-window rate limits for the whole
+// /api surface — mounted BEFORE the X-API-Key gate so unauthenticated
+// key guessing is bounded per IP as well. /healthz lives outside /api
+// and stays exempt (the keep-alive self-ping and the SubNation backend
+// readiness probe must never be throttled).
+app.use("/api", createApiRateLimiter());
 
 app.use("/api", (req, res, next) => {
   if (!requireKey(req, res)) return;
@@ -740,7 +786,7 @@ app.delete("/api/sessions/:id", async (req, res) => {
   }
   sessions.delete(rs.id);
   await fs.rm(`${DATA_DIR}/sessions/${rs.name}`, { recursive: true, force: true }).catch(() => {});
-  deletePersisted(rs.name);
+  await deletePersisted(rs.name);
   log.info({ sessionId: rs.id, name: rs.name }, "[session] deleted");
   return res.json({ deleted: true, id: rs.id });
 });
