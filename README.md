@@ -16,7 +16,7 @@ send-text contract consumed by SubNation's WhatsApp OTP service:
 
 Auth: `X-API-Key: $OPENWA_API_KEY` on every `/api` request.
 
-Lifecycle: `created → initializing → qr_ready → authenticating → ready`
+Lifecycle: `created → initializing → qr_ready → ready`
 (`disconnected` auto-reconnects; logged-out wipes credentials and re-QRs).
 
 ## Environment
@@ -24,6 +24,8 @@ Lifecycle: `created → initializing → qr_ready → authenticating → ready`
 | Var | Required | Meaning |
 | --- | --- | --- |
 | `OPENWA_API_KEY` | yes | shared secret for every `/api` call |
+| `OPENWA_CREDENTIALS_KEY` | no | dedicated secret for encrypting persisted session credentials (`openssl rand -hex 32`, ≥ 32 chars recommended). **Unset = legacy derivation from `OPENWA_API_KEY`** — existing blobs decrypt with zero migration; when set, a blob that still decrypts with the old key is transparently re-encrypted on first read |
+| `PERSISTENCE_URL` | no | Postgres connection string — when set (together with `OPENWA_API_KEY`), session credentials are AES-256-GCM encrypted and persisted, so restarts/spin-downs restore pairings without a new QR scan |
 | `DATA_DIR` | no (default `/data`) | where Baileys credentials persist — **mount a disk here** so the scanned QR survives restarts |
 | `PORT` | no (default 2785) | listen port |
 

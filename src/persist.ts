@@ -260,9 +260,20 @@ export async function loadCreds(name: string): Promise<string | null> {
       try {
         plaintext = decryptWith(blob, deriveKey(API_KEY));
       } catch (legacyErr) {
+        // r98/98-F6 P3-2: name the env vars + the recovery path so an
+        // operator who rotated/typo'd a key gets an actionable pointer
+        // instead of a bare crypto error.
         log.warn(
-          { err: legacyErr, name },
-          "[persist] decrypt failed with BOTH current and legacy key — treating as absent",
+          {
+            err: legacyErr,
+            name,
+            recovery:
+              "unset the wrong OPENWA_CREDENTIALS_KEY (or restore the key that encrypted this blob) " +
+              "and restart — the stored blob is untouched, so the correct key (or the legacy " +
+              "OPENWA_API_KEY derivation) decrypts it on the next boot; only a truly unreadable " +
+              "blob forces a fresh QR pairing",
+          },
+          "[persist] decrypt failed with BOTH OPENWA_CREDENTIALS_KEY (current) and OPENWA_API_KEY (legacy) — treating as absent",
         );
         return null;
       }
@@ -323,6 +334,12 @@ export async function deletePersisted(name: string): Promise<void> {
   cancelPendingSave(name);
   wipedAt.set(name, Date.now());
   lastSavedAt.delete(name);
+  // r98/98-F6 P3-8 (optional hygiene): the tombstone only needs to outlive
+  // saves that STARTED before the wipe — those settle within seconds, so
+  // pruning it after 10 minutes keeps `wipedAt` from growing unbounded
+  // across many delete/re-pair cycles. unref'd: never holds the process
+  // open (same discipline as the rate-limit sweep timers).
+  setTimeout(() => wipedAt.delete(name), 10 * 60_000).unref();
   try {
     const p = await ensurePool();
     if (!p) return;

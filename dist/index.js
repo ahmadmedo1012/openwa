@@ -30,8 +30,8 @@
  * (DASHBOARD_USERNAME / DASHBOARD_PASSWORD env), cookie-authenticated
  * session management UI. Never exposes OPENWA_API_KEY to the browser.
  *
- *   Lifecycle: created → initializing → qr_ready → authenticating →
- *              ready → (disconnected ⇄ reconnect) | failed
+ *   Lifecycle: created → initializing → qr_ready → ready →
+ *              (disconnected ⇄ reconnect) | failed
  *
  * Session credentials persist under DATA_DIR/<name>/ so a scanned QR
  * survives process restarts and redeploys (attach a Render disk).
@@ -44,7 +44,7 @@ import { timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { persistenceEnabled, scheduleSave, flushNow, persistAge, loadCreds, listPersistedNames, deletePersisted, cancelPendingSave, } from "./persist.js";
-import { normalizeChatId, extractAccountDigits, extractLidDigits, resolveSendJid, mergeDeliveryTimeline, pushDeliveryLog, advanceDeliveryStatus, applyConnectionClose, } from "./lib.js";
+import { normalizeChatId, extractAccountDigits, extractLidDigits, resolveSendJid, mergeDeliveryTimeline, pushDeliveryLog, advanceDeliveryStatus, applyConnectionClose, asyncHandler, beginSessionStart, maskDigits, maskJid, } from "./lib.js";
 import { createApiRateLimiter } from "./rate-limit.js";
 import { mountDashboard } from "./dashboard-routes.js";
 import { dashboardEnabled } from "./dashboard.js";
@@ -287,9 +287,12 @@ async function startSession(rs) {
             log.info({
                 sessionId: rs.id,
                 name: rs.name,
-                accountDigits: rs.accountDigits ?? null,
+                // r98/98-F6 P3-3: stdout is a retained surface (Render logs) —
+                // phone digits are masked to the last 4. Full values stay in the
+                // key-gated /api views and the encrypted DB blob.
+                accountDigits: maskDigits(rs.accountDigits ?? ""),
                 accountName: rs.accountName ?? null,
-                accountLidDigits: rs.accountLidDigits ?? null,
+                accountLidDigits: maskDigits(rs.accountLidDigits ?? ""),
             }, "[session] connected (ready)");
             return;
         }
@@ -322,13 +325,16 @@ async function startSession(rs) {
                 // the LATEST signal state, not the pre-disconnect one.
                 // حفظ فوري قبل نافذة إعادة الاتصال.
                 flushSnapshot: () => void flushNow(rs.name, serialize),
-                // Auto-reconnect with backoff unless explicitly stopped.
+                // Auto-reconnect with backoff unless explicitly stopped. The
+                // start goes through the SAME single-flight guard as the routes
+                // (P2-2): a reconnect-timer race with a manual start can never
+                // build a second socket on the auth folder.
                 scheduleReconnect: () => {
                     setTimeout(() => {
                         const cur = sessions.get(rs.id);
                         if (cur && !cur.stopRequested && cur.status === "disconnected") {
                             cur.status = "initializing";
-                            void startSession(cur).catch((err) => log.error({ err, sessionId: rs.id }, "[session] reconnect failed"));
+                            void beginSessionStart(cur, () => startSession(cur)).catch((err) => log.error({ err, sessionId: rs.id }, "[session] reconnect failed"));
                         }
                     }, 5_000);
                 },
@@ -397,7 +403,13 @@ app.use((_req, res, next) => {
     // (verified by the red-team sweep) — no third-party or user-supplied
     // markup ever executes. Everything else is locked to 'none'.
     "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'");
-    if (_req.path.startsWith("/dash/") || _req.path === "/" || _req.path === "/login") {
+    if (_req.path.startsWith("/dash/") ||
+        _req.path === "/" ||
+        _req.path === "/login" ||
+        // r98/98-F6 P3-1: /api responses carry the QR pairing secret and the
+        // linked account's phone digits — they must never be heuristically
+        // cached by an intermediary either.
+        _req.path.startsWith("/api")) {
         res.setHeader("Cache-Control", "no-store");
     }
     next();
@@ -426,7 +438,9 @@ function toDashboardView(rs) {
         async start() {
             if (!rs.socket) {
                 rs.status = rs.status === "created" ? "initializing" : rs.status;
-                await startSession(rs);
+                // P2-2 single-flight: a start already in flight (API route,
+                // reconnect timer, another tab) is AWAITED, never duplicated.
+                await beginSessionStart(rs, () => startSession(rs));
             }
         },
         async requestPairCode(phone) {
@@ -533,7 +547,7 @@ app.get("/api/sessions", (_req, res) => {
     res.json([...sessions.values()].map(publicView));
 });
 // Create session
-app.post("/api/sessions", async (req, res) => {
+app.post("/api/sessions", asyncHandler(async (req, res) => {
     const name = String(req.body?.name ?? "").trim();
     if (!SESSION_NAME_RE.test(name)) {
         return res.status(400).json({ error: "name must match [A-Za-z0-9-]{3,50}" });
@@ -543,7 +557,7 @@ app.post("/api/sessions", async (req, res) => {
         return res.status(created.conflict ? 409 : 500).json({ error: created.error });
     }
     return res.status(201).json(created);
-});
+}));
 // Get one session
 app.get("/api/sessions/:id", (req, res) => {
     const rs = findOr404(req.params.id, res);
@@ -552,26 +566,46 @@ app.get("/api/sessions/:id", (req, res) => {
     return res.json(publicView(rs));
 });
 // Start (or restart) a session
-app.post("/api/sessions/:id/start", async (req, res) => {
+app.post("/api/sessions/:id/start", asyncHandler(async (req, res) => {
     const rs = findOr404(req.params.id, res);
     if (!rs)
         return;
-    if (rs.socket) {
-        return res.json(publicView(rs)); // already running
+    if (!rs.socket && !rs.starting) {
+        // First caller owns the start; the response still goes out immediately
+        // and the status advances via events (unchanged contract).
+        rs.status = rs.status === "created" ? "initializing" : rs.status;
+        res.json(publicView(rs));
+        // r98/98-F6 P2-2: single-flight — the in-flight start is memoized on the
+        // record, so a concurrent start (double-submit, dashboard start, the
+        // reconnect timer racing this route) awaits THIS promise instead of
+        // building a second socket on the same auth folder (WhatsApp answers a
+        // socket conflict with loggedOut → credential wipe → forced re-pair).
+        void beginSessionStart(rs, () => startSession(rs)).catch((err) => {
+            rs.status = "failed";
+            log.error({ err, sessionId: rs.id }, "[session] start failed");
+        });
+        return;
     }
-    rs.status = rs.status === "created" ? "initializing" : rs.status;
-    res.json(publicView(rs)); // respond immediately; status advances via events
-    try {
-        await startSession(rs);
+    if (rs.starting) {
+        // P2-2: ride the in-flight start — a concurrent second start awaits
+        // the SAME promise and never spawns a second engine start.
+        await rs.starting.then(() => res.json(publicView(rs)), () => res.status(500).json({ error: "start_failed" }));
+        return;
     }
-    catch (err) {
-        rs.status = "failed";
-        log.error({ err, sessionId: rs.id }, "[session] start failed");
-    }
-});
+    return res.json(publicView(rs)); // already running
+}));
 // Operator QR page — renders the current pairing QR as PNG in a minimal
 // auto-refreshing HTML page (also serves plain JSON when requested as such).
-app.get("/api/sessions/:id/qr", async (req, res) => {
+//
+// STATUS CONTRACT (r98/98-F6, verified against the consumer — SubNation
+// backend/src/services/openwa.service.ts getWhatsAppSessionQr): the JSON
+// path (Accept: application/json) answers 404 {id,name,status,qr:null} while
+// a QR is not available yet — the consumer's gatewayJson maps any !ok to
+// gateway_request_failed, so 404-while-pairing IS the polling signal, and
+// 200+{qr:null} is only returned once the session is already "ready". The
+// HTML (operator browser) path ALWAYS answers 200 with an auto-refreshing
+// page. The duality is intentional — do NOT unify it.
+app.get("/api/sessions/:id/qr", asyncHandler(async (req, res) => {
     const rs = findOr404(req.params.id, res);
     if (!rs)
         return;
@@ -597,9 +631,9 @@ app.get("/api/sessions/:id/qr", async (req, res) => {
         .status(200)
         .type("html")
         .send(`<meta http-equiv="refresh" content="20"><body style="font-family:sans-serif;background:#0b141a;color:#fff;display:grid;place-items:center;height:100vh;margin:0"><div style="text-align:center"><h2>@${rs.name}</h2><img alt="QR" src="${dataUrl}" width="320" height="320"><p>WhatsApp ← الأجهزة المرتبطة ← ربط جهاز</p><p>تحديث تلقائي كل 20 ثانية</p><p>الحالة: <b>${rs.status}</b></p></div></body>`);
-});
+}));
 // Preflight number check (also warms Baileys' LID cache before send-text).
-app.get("/api/sessions/:id/contacts/check/:number", async (req, res) => {
+app.get("/api/sessions/:id/contacts/check/:number", asyncHandler(async (req, res) => {
     const rs = findOr404(req.params.id, res);
     if (!rs)
         return;
@@ -607,6 +641,12 @@ app.get("/api/sessions/:id/contacts/check/:number", async (req, res) => {
         return res.status(409).json({ error: "session_not_ready", status: rs.status });
     }
     const digits = req.params.number.replace(/[^0-9]/g, "");
+    // r98/98-F6 P3-5: same E.164-ish bounds as pair-code/send-text (8–15
+    // digits) — an unbounded digit string went straight into the WhatsApp
+    // preflight before.
+    if (digits.length < 8 || digits.length > 15) {
+        return res.status(400).json({ error: "number must be 8-15 digits" });
+    }
     try {
         const result = await rs.socket.onWhatsApp(digits);
         const exists = Array.isArray(result) && result[0]?.exists === true;
@@ -616,11 +656,11 @@ app.get("/api/sessions/:id/contacts/check/:number", async (req, res) => {
         log.warn({ err, sessionId: rs.id }, "[contacts/check] failed");
         return res.status(500).json({ error: "check_failed" });
     }
-});
+}));
 // Request a phone-number pairing code (the reliable alternative to QR:
 // no rotation timing, entered manually on the phone under
 // Linked devices → "Link with phone number instead").
-app.post("/api/sessions/:id/pair-code", async (req, res) => {
+app.post("/api/sessions/:id/pair-code", asyncHandler(async (req, res) => {
     const rs = findOr404(req.params.id, res);
     if (!rs)
         return;
@@ -641,9 +681,9 @@ app.post("/api/sessions/:id/pair-code", async (req, res) => {
         log.error({ err, sessionId: rs.id }, "[pair-code] request failed");
         return res.status(500).json({ error: "pair_code_failed" });
     }
-});
+}));
 // Delete a session (stops engine, wipes local + persisted credentials).
-app.delete("/api/sessions/:id", async (req, res) => {
+app.delete("/api/sessions/:id", asyncHandler(async (req, res) => {
     const rs = findOr404(req.params.id, res);
     if (!rs)
         return;
@@ -659,7 +699,7 @@ app.delete("/api/sessions/:id", async (req, res) => {
     await deletePersisted(rs.name);
     log.info({ sessionId: rs.id, name: rs.name }, "[session] deleted");
     return res.json({ deleted: true, id: rs.id });
-});
+}));
 /**
  * Shared send path for send-text + test: validates input, detects self-send
  * (target digits === linked account digits) and routes the modern self-chat
@@ -680,7 +720,10 @@ async function engineSend(rs, chatIdRaw, text) {
     const targetDigits = pnJid.slice(0, pnJid.indexOf("@"));
     const route = resolveSendJid(targetDigits, rs.accountDigits, rs.accountLidDigits, SELF_SEND_LID_ENABLED);
     if (route.viaLid) {
-        log.info({ sessionId: rs.id, accountDigits: rs.accountDigits, lid: rs.accountLidDigits }, "[send] self-send detected — routing via LID (مسار المحادثة الذاتية)");
+        log.info(
+        // r98/98-F6 P3-3: digits masked in stdout; full values stay in the
+        // delivery-log/API surfaces.
+        { sessionId: rs.id, accountDigits: maskDigits(rs.accountDigits ?? ""), lid: maskDigits(rs.accountLidDigits ?? "") }, "[send] self-send detected — routing via LID (مسار المحادثة الذاتية)");
     }
     let messageId = null;
     let usedJid = route.jid;
@@ -691,7 +734,7 @@ async function engineSend(rs, chatIdRaw, text) {
     }
     catch (err) {
         if (!route.viaLid) {
-            log.error({ err, sessionId: rs.id, chatId: targetDigits }, "[send] failed");
+            log.error({ err, sessionId: rs.id, chatId: maskDigits(targetDigits) }, "[send] failed");
             return { ok: false, code: 500, error: "send_failed" };
         }
         // LID self-send rejected — retry the legacy PN form before giving up.
@@ -704,13 +747,13 @@ async function engineSend(rs, chatIdRaw, text) {
             usedJid = route.pnJid;
         }
         catch (err2) {
-            log.error({ err: err2, sessionId: rs.id, chatId: targetDigits }, "[send] PN retry failed too");
+            log.error({ err: err2, sessionId: rs.id, chatId: maskDigits(targetDigits) }, "[send] PN retry failed too");
             return { ok: false, code: 500, error: "send_failed" };
         }
     }
     // Track the messageId the ENGINE generated — acks in messages.update are
     // matched against this, never against arbitrary fromMe traffic.
-    // تسجيل معرف الرسالة الفعلي في سجل التسليم (حلقة بحد 25).
+    // تسجيل معرف الرسالة الفعلي في سجل التسليم (حلقة بحد 500).
     if (messageId) {
         rs.deliveryLog = pushDeliveryLog(rs.deliveryLog ?? [], {
             messageId,
@@ -721,7 +764,10 @@ async function engineSend(rs, chatIdRaw, text) {
     }
     log.info({
         sessionId: rs.id,
-        chatId: usedJid,
+        // r98/98-F6 P3-3: stdout keeps the masked JID (last-4 digits +
+        // domain); the FULL chatId is preserved in the delivery-log entry
+        // above and the DB blob — only the log surface is redacted.
+        chatId: maskJid(usedJid),
         selfSend: route.selfSend,
         viaLid: usedJid !== route.pnJid,
         messageId,
@@ -733,7 +779,7 @@ async function engineSend(rs, chatIdRaw, text) {
     return { ok: true, messageId, selfSend: route.selfSend };
 }
 // Send text
-app.post("/api/sessions/:id/messages/send-text", async (req, res) => {
+app.post("/api/sessions/:id/messages/send-text", asyncHandler(async (req, res) => {
     const rs = findOr404(req.params.id, res);
     if (!rs)
         return;
@@ -750,12 +796,12 @@ app.post("/api/sessions/:id/messages/send-text", async (req, res) => {
         selfSend: out.selfSend,
         delivery: rs.lastDeliveryStatus ?? "pending",
     });
-});
+}));
 // Live channel test: fixed text through the exact send-text logic (incl.
 // self-send LID routing) and recorded in the delivery log.
 // اختبار حي لقناة واتساب برسالة ثابتة — للتحقق من وصول الرسائل فعليًا.
 const TEST_MESSAGE_TEXT = "🔧 رسالة اختبار من نظام SubNation — إن وصلتك هذه الرسالة فقناة واتساب تعمل بشكل سليم";
-app.post("/api/sessions/:id/messages/test", async (req, res) => {
+app.post("/api/sessions/:id/messages/test", asyncHandler(async (req, res) => {
     const rs = findOr404(req.params.id, res);
     if (!rs)
         return;
@@ -767,10 +813,10 @@ app.post("/api/sessions/:id/messages/test", async (req, res) => {
         return res.status(out.code).json({ error: out.error });
     }
     return res.json({ ok: true, messageId: out.messageId, selfSend: out.selfSend });
-});
+}));
 // Outbound delivery log (ENGINE-sent messages only) — the OTP backend polls
 // this to verify an OTP actually reached the device instead of guessing.
-// سجل تسليم الرسائل الصادرة من المحرك فقط (حتى 25 رسالة).
+// سجل تسليم الرسائل الصادرة من المحرك فقط (حتى 500 رسالة).
 app.get("/api/sessions/:id/delivery-log", (req, res) => {
     const rs = findOr404(req.params.id, res);
     if (!rs)
@@ -779,6 +825,24 @@ app.get("/api/sessions/:id/delivery-log", (req, res) => {
 });
 // JSON 404 for anything else under /api
 app.use("/api", (_req, res) => res.status(404).json({ error: "not found" }));
+// ── Terminal error middleware (r98/98-F6, P2-1) ─────────────────────────────
+// Express 4 does NOT route async rejections anywhere: every async handler
+// above is wrapped with asyncHandler (lib.ts) so an unexpected rejection
+// becomes next(err) and lands HERE instead of leaving the request hanging
+// forever (the process guard only LOGS unhandledRejection). Covers the
+// dashboard router too: mountDashboard registers its routes on THIS app
+// (no separate express instance), and requireAuth forwards `next` for
+// exactly that reason. Generic 500 body — the real error goes to pino,
+// never to the response. headersSent → delegate to Express's default
+// final handler (it safely destroys the stream).
+app.use((err, _req, res, next) => {
+    log.error({ err }, "[http] unhandled error — answered with 500");
+    if (res.headersSent) {
+        next(err);
+        return;
+    }
+    res.status(500).json({ error: "internal" });
+});
 app.listen(PORT, "0.0.0.0", async () => {
     log.info({ port: PORT, dataDir: DATA_DIR }, "[gateway] listening");
     // ── Self-ping keep-alive — REMOVED (2026-09-20 free-infrastructure round)
@@ -809,7 +873,9 @@ app.listen(PORT, "0.0.0.0", async () => {
                 createdAt: new Date().toISOString(),
             };
             sessions.set(rs.id, rs);
-            await startSession(rs).catch((err) => log.error({ err, name }, "[boot] auto-restore failed"));
+            // P2-2 single-flight: a manual /start or dash start racing the boot
+            // restore awaits the SAME in-flight start, never a second socket.
+            await beginSessionStart(rs, () => startSession(rs)).catch((err) => log.error({ err, name }, "[boot] auto-restore failed"));
             log.info({ name }, "[boot] session restored from persistence");
         }
     }

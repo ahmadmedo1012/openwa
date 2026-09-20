@@ -1,14 +1,4 @@
 /**
- * Pure helpers extracted from the engine — deterministic, side-effect-free
- * (except timestamps, which are injectable where it matters), and unit
- * testable with zero dependencies (tests/lib.test.mjs imports dist/lib.js).
- *
- * دوال نقية مستخرجة من المحرك — يمكن اختبارها بدون Baileys/Express/Postgres.
- *
- * Shared by index.ts for: chat normalization, account/LID digit extraction,
- * self-send LID routing, and the outbound delivery log.
- */
-/**
  * Ring-buffer cap for the per-session delivery log — the LATEST 500
  * engine-sent messages are kept (oldest dropped past the cap). WA-04:
  * enough history for diagnostics, still strictly bounded per session.
@@ -147,6 +137,65 @@ export function pushDeliveryLog(log, entry, cap = DELIVERY_LOG_CAP) {
     const next = [...log, entry];
     const overflow = next.length - Math.max(1, cap);
     return overflow > 0 ? next.slice(overflow) : next;
+}
+// ── Express-4 async-rejection safety (r98/98-F6, P2-1) ─────────────────────
+/**
+ * Wrap an async Express route handler so a REJECTION is converted to
+ * `next(err)` and reaches the terminal error middleware that index.ts
+ * mounts after all routes. Express 4 does NOT route async rejections
+ * itself (that landed in v5): without this wrapper an unexpected throw in
+ * an async handler leaves the HTTP request hanging forever — the process
+ * guard only LOGS unhandledRejection. Express 4 already catches SYNC
+ * throws, so only async handlers need wrapping.
+ * تغويل رفض الدوال غير المتزامنة إلى next(err) بدل تعليق الطلب للأبد.
+ */
+export function asyncHandler(fn) {
+    return (req, res, next) => {
+        Promise.resolve(fn(req, res, next)).catch(next);
+    };
+}
+/**
+ * TOCTOU guard for startSession: `rs.socket` is only assigned AFTER the
+ * `useMultiFileAuthState` + `fetchLatestBaileysVersion` awaits, so a plain
+ * "if (!rs.socket) start()" check lets two overlapping starts build TWO
+ * Baileys sockets on one auth folder — WhatsApp answers that conflict with
+ * DisconnectReason.loggedOut, whose close handler WIPES the credentials
+ * (session loss). Memoizing the in-flight promise on the record makes every
+ * concurrent caller (POST /start, dashboard start, reconnect timer, boot
+ * self-heal) await the SAME engine start instead of starting a second one.
+ * حارس سباق بدء الجلسة: كل المتصلين المتزامنين ينتظرون نفس الوعد.
+ */
+export function beginSessionStart(rs, start) {
+    rs.starting ??= start().finally(() => {
+        rs.starting = undefined;
+    });
+    return rs.starting;
+}
+// ── PII masking for stdout logs (r98/98-F6, P3-3) ──────────────────────────
+/**
+ * Redact phone digits for STDOUT logs (Render retains them): keep only the
+ * LAST 4 digits behind an ellipsis — "218910089975" → "…9975". Full values
+ * stay where they belong: the key-gated /api responses, the delivery-log
+ * ring buffer, and the encrypted DB blob. Only the log surface is masked.
+ * إخفاء أرقام الهواتف في السجلات — آخر 4 أرقام فقط.
+ */
+export function maskDigits(raw) {
+    const digits = chatDigits(raw);
+    return digits.length === 0 ? "" : `…${digits.slice(-4)}`;
+}
+/**
+ * JID-aware masking: masks the user part but KEEPS the domain suffix —
+ * "218910089975@s.whatsapp.net" → "…9975@s.whatsapp.net",
+ * "192616985542878@lid" → "…2878@lid" — so operators can still tell a
+ * self-send LID route from a plain phone JID while the digits stay redacted.
+ * قناع واعٍ بالصيغة: يخفي الأرقام ويُبقي نطاق العنوان.
+ */
+export function maskJid(jid) {
+    const s = String(jid ?? "");
+    const at = s.indexOf("@");
+    if (at <= 0)
+        return maskDigits(s);
+    return `${maskDigits(s.slice(0, at))}@${s.slice(at + 1)}`;
 }
 /**
  * Wipe every pairing-scoped identity field (WA-02). In-place reset of the

@@ -12,15 +12,32 @@
  *   GET    /dash/api/sessions/:id/qr         → {qrImage,status}
  *   DELETE /dash/api/sessions/:id
  *
+ * Every ASYNC handler is wrapped with asyncHandler (lib.ts): Express 4
+ * does not route async rejections to error middleware, so a rejection is
+ * converted to next(err) and answered by the TERMINAL error middleware
+ * index.ts mounts after all routes (this file registers on the same app —
+ * there is no separate express instance). requireAuth forwards `next`
+ * for exactly that reason.
+ *
+ * Pair-code issuance is guarded per session (one in flight + a 60s
+ * cooldown, bounded map, cap 128 — r98/98-F6 P3-6): the /api twin is
+ * rate-limited 5/hour/IP, but this cookie-authenticated surface can't key
+ * by IP (operators legitimately share NATs; the signed cookie is the real
+ * identity).
+ *
  * The registry + engine functions are injected by index.ts so this file
  * never imports the engine directly (no cycles, testable in isolation).
  */
 import express from "express";
 import { dashboardPage, disabledPage, loginPage } from "./dashboard-html.js";
+import { asyncHandler } from "./lib.js";
 import { dashboardEnabled, issueToken, verifyToken, isLocked, recordFailure, clearFailures, credentialsOk, cookieOptions, clientIp, jsonSafeDate, COOKIE_NAME, } from "./dashboard.js";
-/** Wrap a handler so it requires a valid session cookie. */
+/** Wrap a handler so it requires a valid session cookie. Forwards `next`
+ * so the asyncHandler underneath can convert a rejection into next(err)
+ * (Express 4 skips normal middleware when next receives a truthy error —
+ * a dropped `next` would silently swallow the error path). */
 function requireAuth(handler) {
-    return (req, res) => {
+    return (req, res, next) => {
         if (!verifyToken(req.cookies?.[COOKIE_NAME])) {
             if (req.path.startsWith("/dash/api/")) {
                 res.status(401).json({ error: "unauthorized" });
@@ -29,7 +46,58 @@ function requireAuth(handler) {
             res.redirect("/");
             return;
         }
-        return handler(req, res);
+        return handler(req, res, next);
+    };
+}
+// ── Pair-code issuance guard (r98/98-F6, P3-6) ─────────────────────────────
+// The /api twin is 5/hour/IP (rate-limit.ts); cookie-auth makes IP keying
+// awkward (operators legitimately share NATs — the signed cookie is the
+// real identity), so issuance is bounded per SESSION: one in flight + a
+// 60s cooldown between attempts. Bounded map (cap 128) — the same
+// bounded-map discipline as rate-limit.ts, trimmed FIFO by oldest
+// timestamp. Module-level: mountDashboard is called exactly once in
+// production, so this is equivalent to per-mount state.
+const DASH_PAIR_CODE_COOLDOWN_MS = 60_000;
+const DASH_PAIR_CODE_MAP_CAP = 128;
+const pairCodeInFlight = new Set();
+const pairCodeLastAt = new Map();
+/** Injectable clock (tests only — see __pairCodeGuardForTest). */
+let pairCodeNow = Date.now;
+function pairCodeBlocked(id) {
+    if (pairCodeInFlight.has(id))
+        return true;
+    const last = pairCodeLastAt.get(id);
+    return last != null && pairCodeNow() - last < DASH_PAIR_CODE_COOLDOWN_MS;
+}
+function pairCodeMarkAttempt(id) {
+    pairCodeLastAt.set(id, pairCodeNow());
+    if (pairCodeLastAt.size > DASH_PAIR_CODE_MAP_CAP) {
+        let oldestKey = null;
+        let oldestAt = Infinity;
+        for (const [k, t] of pairCodeLastAt) {
+            if (t < oldestAt) {
+                oldestAt = t;
+                oldestKey = k;
+            }
+        }
+        if (oldestKey)
+            pairCodeLastAt.delete(oldestKey);
+    }
+}
+/**
+ * @internal Test-only surface (the persist.ts __cryptoForTest idiom):
+ * clock injection + state reset for tests/gateway-hardening.test.mjs.
+ * Never used by runtime code paths.
+ */
+export function __pairCodeGuardForTest() {
+    return {
+        reset: () => {
+            pairCodeLastAt.clear();
+            pairCodeInFlight.clear();
+        },
+        setClock: (fn) => {
+            pairCodeNow = fn;
+        },
     };
 }
 export function mountDashboard(app, deps) {
@@ -117,21 +185,23 @@ export function mountDashboard(app, deps) {
         }));
         json(res, 200, { sessions, info: deps.info() });
     }));
-    app.post("/dash/api/sessions", requireAuth(async (req, res) => {
+    app.post("/dash/api/sessions", requireAuth(asyncHandler(async (req, res) => {
         const name = String(req.body?.name ?? "").trim();
         if (!/^[A-Za-z0-9-]{3,50}$/.test(name)) {
             json(res, 400, { error: "الاسم يجب أن يكون 3–50 حرفًا إنجليزيًا/رقمًا/شرطة" });
             return;
         }
         // Delegate creation to the engine's create path (name already validated).
+        // No local try/catch on purpose: an unexpected rejection flows through
+        // asyncHandler → next(err) → index.ts's terminal error middleware.
         const created = await deps.createSession(name);
         if ("error" in created) {
             json(res, created.conflict ? 409 : 500, { error: created.error });
             return;
         }
         json(res, 201, { session: created });
-    }));
-    app.post("/dash/api/sessions/:id/start", requireAuth(async (req, res) => {
+    })));
+    app.post("/dash/api/sessions/:id/start", requireAuth(asyncHandler(async (req, res) => {
         const s = deps.sessions().find((x) => x.id === req.params.id);
         if (!s) {
             json(res, 404, { error: "الجلسة غير موجودة" });
@@ -144,8 +214,8 @@ export function mountDashboard(app, deps) {
         catch {
             json(res, 500, { error: "تعذر تشغيل الجلسة" });
         }
-    }));
-    app.post("/dash/api/sessions/:id/pair-code", requireAuth(async (req, res) => {
+    })));
+    app.post("/dash/api/sessions/:id/pair-code", requireAuth(asyncHandler(async (req, res) => {
         const s = deps.sessions().find((x) => x.id === req.params.id);
         if (!s) {
             json(res, 404, { error: "الجلسة غير موجودة" });
@@ -156,6 +226,15 @@ export function mountDashboard(app, deps) {
             json(res, 400, { error: "أدخل رقمًا دوليًا صحيحًا مثل 21891XXXXXXX" });
             return;
         }
+        // r98/98-F6 P3-6: per-session issuance guard — one request in flight +
+        // a 60s cooldown (attempts count, mirroring the /api limiter's
+        // count-every-request semantics). Cookie-auth makes IP keying awkward.
+        if (pairCodeBlocked(s.id)) {
+            json(res, 429, { error: "رمز ربط لهذه الجلسة صدر للتو — انتظر قليلًا ثم أعد المحاولة" });
+            return;
+        }
+        pairCodeInFlight.add(s.id);
+        pairCodeMarkAttempt(s.id);
         try {
             const code = await s.requestPairCode(phone);
             json(res, 200, { code });
@@ -163,13 +242,18 @@ export function mountDashboard(app, deps) {
         catch {
             json(res, 502, { error: "تعذر إصدار رمز الربط — تأكد أن الجلسة قيد التشغيل ثم أعد المحاولة" });
         }
-    }));
-    app.get("/dash/api/sessions/:id/qr", requireAuth(async (req, res) => {
+        finally {
+            pairCodeInFlight.delete(s.id);
+        }
+    })));
+    app.get("/dash/api/sessions/:id/qr", requireAuth(asyncHandler(async (req, res) => {
         const s = deps.sessions().find((x) => x.id === req.params.id);
         if (!s) {
             json(res, 404, { error: "الجلسة غير موجودة" });
             return;
         }
+        // P2-1: this await was the classic unguarded one — qrcode's dynamic
+        // import/toDataURL rejection now flows to the terminal error mw.
         const QRCode = await import("qrcode");
         const raw = s.qrString();
         if (!raw) {
@@ -178,8 +262,8 @@ export function mountDashboard(app, deps) {
         }
         const qrImage = await QRCode.toDataURL(raw, { margin: 2, width: 320 });
         json(res, 200, { qrImage, status: s.status });
-    }));
-    app.delete("/dash/api/sessions/:id", requireAuth(async (req, res) => {
+    })));
+    app.delete("/dash/api/sessions/:id", requireAuth(asyncHandler(async (req, res) => {
         const s = deps.sessions().find((x) => x.id === req.params.id);
         if (!s) {
             json(res, 404, { error: "الجلسة غير موجودة" });
@@ -192,5 +276,5 @@ export function mountDashboard(app, deps) {
         catch {
             json(res, 500, { error: "تعذر حذف الجلسة" });
         }
-    }));
+    })));
 }

@@ -9,13 +9,12 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "npm run build && node --test tests/lib.test.mjs tests/rate-limit.test.mjs tests/logged-out-reset.test.mjs tests/persist-key-separation.test.mjs"
+    "test": "npm run build && node --test tests/lib.test.mjs tests/rate-limit.test.mjs tests/logged-out-reset.test.mjs tests/persist-key-separation.test.mjs tests/gateway-hardening.test.mjs"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "@types/pg": "^8.23.1",
     "@whiskeysockets/baileys": "^6.7.9",
     "express": "^4.21.2",
     "nanoid": "^5.0.9",
@@ -26,6 +25,7 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.10.5",
+    "@types/pg": "^8.23.1",
     "@types/qrcode": "^1.5.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
