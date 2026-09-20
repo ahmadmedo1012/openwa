@@ -6,8 +6,21 @@
  * scan. Persisting the (encrypted) credentials blob in the app's Neon
  * database lets every boot restore previously-paired sessions automatically.
  *
- * Security: credentials are AES-256-GCM encrypted with a key derived from
- * OPENWA_API_KEY via scrypt. The DB stores ciphertext only.
+ * Security (2026-09-20 final audit — key separation): credentials are
+ * AES-256-GCM encrypted with a key derived via scrypt. The key material
+ * prefers the dedicated OPENWA_CREDENTIALS_KEY env var; when unset it
+ * falls back to OPENWA_API_KEY (the original derivation — byte-identical,
+ * so existing persisted blobs decrypt with ZERO migration). Splitting the
+ * two concerns means rotating the API key (request auth) no longer
+ * invalidates every stored session, and a leaked API key alone can no
+ * longer decrypt the credential blobs.
+ *
+ * Transparent re-key: when OPENWA_CREDENTIALS_KEY is set (and differs
+ * from the API key), a blob that fails to decrypt with the current key is
+ * retried with the legacy API-key derivation; on success the plaintext is
+ * re-encrypted with the current key and re-stored immediately. The
+ * WA-02 wipe tombstone is respected (a wiped name is never resurrected).
+ * The DB stores ciphertext only.
  */
 import { Pool } from "pg";
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto";
@@ -17,11 +30,51 @@ const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
 const PERSISTENCE_URL = (process.env.PERSISTENCE_URL ?? "").trim();
 const API_KEY = (process.env.OPENWA_API_KEY ?? "").trim();
+/**
+ * Dedicated credentials-encryption secret. Empty (unset) keeps the exact
+ * pre-2026-09-20 behaviour: credentials key == API key.
+ */
+const CREDENTIALS_KEY = (process.env.OPENWA_CREDENTIALS_KEY ?? "").trim();
+
+if (CREDENTIALS_KEY && CREDENTIALS_KEY.length < 32) {
+  log.warn(
+    { length: CREDENTIALS_KEY.length },
+    "[persist] OPENWA_CREDENTIALS_KEY is shorter than 32 chars — recommended: openssl rand -hex 32",
+  );
+}
 
 let pool: Pool | null = null;
 
+/** Effective key material for credentials encryption. */
+function credentialsKeyMaterial(): string {
+  return CREDENTIALS_KEY || API_KEY;
+}
+
+/**
+ * True when a DEDICATED credentials key is active and differs from the
+ * API key — i.e. blobs written before the split still decrypt with the
+ * legacy derivation and may need the transparent re-key path.
+ */
+function legacyKeyAvailable(): boolean {
+  return Boolean(CREDENTIALS_KEY && CREDENTIALS_KEY !== API_KEY);
+}
+
+// Memoized derivations (2026-09-20 final audit): scryptSync is expensive
+// (~50-100 ms per call) and ran on EVERY encrypt/decrypt — the debounced
+// write-through saves every few seconds. Same memoization discipline as
+// dashboard.ts sessionSecret (SEC1/P1-2).
+const keyCache = new Map<string, Buffer>();
+function deriveKey(material: string): Buffer {
+  let k = keyCache.get(material);
+  if (!k) {
+    k = scryptSync(material, "openwa-gateway-creds-v1", 32);
+    keyCache.set(material, k);
+  }
+  return k;
+}
+
 function key(): Buffer {
-  return scryptSync(API_KEY, "openwa-gateway-creds-v1", 32);
+  return deriveKey(credentialsKeyMaterial());
 }
 
 function encrypt(plain: string): Buffer {
@@ -31,13 +84,18 @@ function encrypt(plain: string): Buffer {
   return Buffer.concat([iv, cipher.getAuthTag(), enc]);
 }
 
-function decrypt(blob: Buffer): string {
+/** Decrypt with an EXPLICIT key (current or legacy). Throws on wrong key. */
+function decryptWith(blob: Buffer, k: Buffer): string {
   const iv = blob.subarray(0, 12);
   const tag = blob.subarray(12, 28);
   const data = blob.subarray(28);
-  const decipher = createDecipheriv("aes-256-gcm", key(), iv);
+  const decipher = createDecipheriv("aes-256-gcm", k, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
+}
+
+function decrypt(blob: Buffer): string {
+  return decryptWith(blob, key());
 }
 
 async function ensurePool(): Promise<Pool | null> {
@@ -167,14 +225,74 @@ export function persistAge(name: string): number | null {
   return t == null ? null : Date.now() - t;
 }
 
-/** Load + decrypt stored credentials JSON for a session name (or null). */
+/**
+ * Load + decrypt stored credentials JSON for a session name (or null).
+ *
+ * 2026-09-20 key-separation: tries the CURRENT key first; on failure (GCM
+ * auth-tag mismatch = wrong key) and when a dedicated credentials key is
+ * active, retries with the LEGACY API-key derivation. A legacy success is
+ * transparently re-encrypted with the current key and re-stored, so the
+ * blob migrates on first read with zero operator action. If both keys
+ * fail the blob is treated as unreadable (null) — the session re-pairs
+ * via QR exactly as before; the blob itself is left untouched so an
+ * operator who unset a WRONG credentials key can still recover by
+ * restarting (the legacy path will decrypt it again).
+ */
 export async function loadCreds(name: string): Promise<string | null> {
   try {
     const p = await ensurePool();
     if (!p) return null;
     const res = await p.query(`SELECT creds FROM openwa_sessions WHERE name = $1`, [name]);
     if (res.rowCount === 0) return null;
-    return decrypt(res.rows[0].creds as Buffer);
+    const blob = res.rows[0].creds as Buffer;
+
+    try {
+      return decrypt(blob);
+    } catch (currentKeyErr) {
+      if (!legacyKeyAvailable()) {
+        log.warn(
+          { err: currentKeyErr, name },
+          "[persist] decrypt failed with the current key — treating as absent",
+        );
+        return null;
+      }
+      let plaintext: string;
+      try {
+        plaintext = decryptWith(blob, deriveKey(API_KEY));
+      } catch (legacyErr) {
+        log.warn(
+          { err: legacyErr, name },
+          "[persist] decrypt failed with BOTH current and legacy key — treating as absent",
+        );
+        return null;
+      }
+      // Legacy decrypt succeeded → transparent re-key. WA-02 discipline:
+      // never resurrect a wiped name (the boot path has no tombstones, but
+      // this guard keeps the invariant total).
+      const wipe = wipedAt.get(name);
+      if (wipe != null) {
+        log.warn({ name }, "[persist] legacy blob readable but name is tombstoned — skipping re-key");
+        return null;
+      }
+      try {
+        await p.query(
+          `UPDATE openwa_sessions SET creds = $2, updated_at = NOW() WHERE name = $1`,
+          [name, encrypt(plaintext)],
+        );
+        log.info(
+          { name },
+          "[persist] re-keyed legacy credentials blob to OPENWA_CREDENTIALS_KEY",
+        );
+      } catch (rekeyErr) {
+        // Re-key write failed (transient DB issue): still return the
+        // plaintext — the next save writes it with the current key anyway.
+        log.warn(
+          { err: rekeyErr, name },
+          "[persist] re-key UPDATE failed — returning plaintext; next save will re-encrypt",
+        );
+      }
+      return plaintext;
+    }
   } catch (err) {
     log.warn({ err, name }, "[persist] load failed");
     return null;
@@ -212,4 +330,26 @@ export async function deletePersisted(name: string): Promise<void> {
   } catch {
     // best-effort
   }
+}
+
+/**
+ * @internal Test-only surface for the 2026-09-20 key-separation audit.
+ * Exposes the pure crypto paths so tests can prove:
+ *   - unset OPENWA_CREDENTIALS_KEY → byte-identical legacy derivation
+ *   - set + differing → new derivation, legacy fallback readable
+ *   - wrong key → decrypt throws (GCM auth tag)
+ * Never used by runtime code paths.
+ */
+export function __cryptoForTest(): {
+  encryptCurrent: (plain: string) => Buffer;
+  decryptCurrent: (blob: Buffer) => string;
+  decryptLegacy: (blob: Buffer) => string;
+  legacyKeyAvailable: () => boolean;
+} {
+  return {
+    encryptCurrent: encrypt,
+    decryptCurrent: decrypt,
+    decryptLegacy: (blob: Buffer) => decryptWith(blob, deriveKey(API_KEY)),
+    legacyKeyAvailable,
+  };
 }
