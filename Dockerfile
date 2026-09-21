@@ -1,18 +1,27 @@
 # syntax=docker/dockerfile:1.7
+# R104 (AG12-2/AG12-3): lockfile-faithful builds (npm ci, not npm install)
+# and a production-only runtime image (devDeps no longer ship — was
+# ~60-90 MB of typescript/tsx/@types dead weight in every pull).
 FROM node:22-alpine AS build
 WORKDIR /app
 # git is required by npm when a dependency resolves from a git URL.
 RUN apk add --no-cache git
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+# Lockfile copied → reproducible resolution + faster installs.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
+FROM node:22-alpine AS deps-prod
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
+
 FROM node:22-alpine
 ENV NODE_ENV=production DATA_DIR=/data PORT=2785
 WORKDIR /app
-COPY --from=build /app/node_modules ./node_modules
+COPY --from=deps-prod /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 RUN mkdir -p /data && chown -R node:node /app /data

@@ -357,8 +357,25 @@ document.addEventListener('dialog:qr',()=>startQrPolling());
 const origShow=HTMLDialogElement.prototype.showModal;
 HTMLDialogElement.prototype.showModal=function(){origShow.call(this);
   if(this.id==='qr-modal')startQrPolling()};
-load();
-pollTimer=setInterval(load,5000);
+// R104 (AG4-1): the dashboard poll no longer fires unconditionally.
+// An operator tab left open (even backgrounded) polled /dash/api/state
+// every 5s forever — inbound traffic that kept the gateway's Render
+// free instance awake 24/7 (one forgotten tab ≈ 720 of the shared 750
+// instance-hours/month). New contract:
+//   - VISIBLE tab: 5s while any session is mid-lifecycle (anything but
+//     ready/failed), 30s once every session is steady-state;
+//   - HIDDEN tab: paused entirely (resumes on the next visibilitychange).
+function dashTick(){
+  if(document.visibilityState!=='visible'){clearInterval(pollTimer);pollTimer=null;return}
+  const busy=CURRENT.some(s=>s.status!=='ready'&&s.status!=='failed');
+  const want=busy?5000:30000;
+  if(!pollTimer||tickMs!==want){tickMs=want;clearInterval(pollTimer);
+    pollTimer=setInterval(dashTick,want)}
+  void load();
+}
+let tickMs=0;
+document.addEventListener('visibilitychange',()=>{dashTick()});
+dashTick(); // RT-7: dashTick itself loads — no double fetch on open
 </script>
 </body></html>`;
 }

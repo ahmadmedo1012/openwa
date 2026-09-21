@@ -61,6 +61,9 @@ if (!API_KEY) {
 }
 const SESSION_NAME_RE = /^[A-Za-z0-9-]{3,50}$/;
 // ── Registry ─────────────────────────────────────────────────────────────────
+/** R104 (AG7-4): 24 h in-process cache for the baileys version registry. */
+let versionCache;
+let versionCacheAt = 0;
 const sessions = new Map(); // by id
 function publicView(rs) {
     const persistAgeMs = persistAge(rs.name);
@@ -69,6 +72,7 @@ function publicView(rs) {
         name: rs.name,
         status: rs.status,
         createdAt: rs.createdAt,
+        ...(rs.pairingId ? { pairingId: rs.pairingId } : {}),
         ...(rs.lastReadyAt ? { lastReadyAt: rs.lastReadyAt } : {}),
         ...(rs.lastDeliveryStatus ? { lastDeliveryStatus: rs.lastDeliveryStatus } : {}),
         ...(rs.accountDigits ? { accountDigits: rs.accountDigits } : {}),
@@ -152,13 +156,25 @@ async function startSession(rs) {
             scheduleKeySave();
         };
     }
+    // R104 (AG7-4): 24 h in-process cache. The registry fetch fired on
+    // EVERY session start (each boot-restore after an idle sleep included)
+    // — one outbound HTTPS call per wake for a value that changes a few
+    // times a year.
     let version;
-    try {
-        const latest = await fetchLatestBaileysVersion();
-        version = latest.version;
+    if (versionCache && Date.now() - versionCacheAt > 86_400_000) {
+        versionCache = undefined;
     }
-    catch {
-        // offline registry / transient — baileys falls back to its baked-in version
+    version = versionCache;
+    if (!version) {
+        try {
+            const latest = await fetchLatestBaileysVersion();
+            version = latest.version;
+            versionCache = version;
+            versionCacheAt = Date.now();
+        }
+        catch {
+            // offline registry / transient — baileys falls back to its baked-in version
+        }
     }
     rs.status = rs.status === "created" ? "initializing" : rs.status;
     if (hasStoredCreds(state)) {
@@ -278,6 +294,14 @@ async function startSession(rs) {
             rs.qrString = undefined;
             rs.lastReadyAt = new Date().toISOString();
             rs.connectedAt = rs.lastReadyAt;
+            // R104 (AG4-2): stable pairing identity — registrationId lives in
+            // the creds folder, so a RESTORE re-observes the same value while a
+            // re-pair observes a new one. Undefined on legacy/edge shapes (the
+            // backend then falls back to lastReadyAt — no behavior change).
+            const registrationId = sock.authState.creds.registrationId;
+            if (typeof registrationId === "number")
+                rs.pairingId = String(registrationId);
+            rs.reconnectAttempts = 0; // R104 (AG4-3): backoff decays after a healthy connect
             // Capture the linked-account identity for self-send detection +
             // enriched views. التقاط هوية الحساب المرتبط (رقم/اسم/LID).
             const me = sock.authState.creds.me;
@@ -330,13 +354,22 @@ async function startSession(rs) {
                 // (P2-2): a reconnect-timer race with a manual start can never
                 // build a second socket on the auth folder.
                 scheduleReconnect: () => {
-                    setTimeout(() => {
+                    // R104 (AG4-3): exponential backoff + jitter (was a fixed 5 s
+                    // with no cap on attempts). During a WhatsApp/network outage
+                    // the fixed cadence fired ~12 attempts/min per session and
+                    // every disconnect ALSO flushed a Neon snapshot — bounded
+                    // churn that now decays to one attempt per 5 min.
+                    const attempt = (rs.reconnectAttempts = (rs.reconnectAttempts ?? 0) + 1);
+                    const base = Math.min(5_000 * 2 ** (attempt - 1), 300_000);
+                    const delay = base * (0.75 + Math.random() * 0.5);
+                    const timer = setTimeout(() => {
                         const cur = sessions.get(rs.id);
-                        if (cur && !cur.stopRequested && cur.status === "disconnected") {
-                            cur.status = "initializing";
-                            void beginSessionStart(cur, () => startSession(cur)).catch((err) => log.error({ err, sessionId: rs.id }, "[session] reconnect failed"));
-                        }
-                    }, 5_000);
+                        if (!cur || cur.stopRequested || cur.status !== "disconnected")
+                            return;
+                        cur.status = "initializing";
+                        void beginSessionStart(cur, () => startSession(cur)).catch((err) => log.error({ err, sessionId: rs.id }, "[session] reconnect failed"));
+                    }, delay);
+                    timer.unref?.();
                 },
             });
             if (outcome === "failed") {
@@ -382,7 +415,25 @@ function requireKey(req, res) {
     return true;
 }
 function findOr404(id, res) {
-    const rs = sessions.get(id);
+    // R104 (AG4-4): accept the session NAME in the {id} path too. The OTP
+    // backend configured by name (`WHATSAPP_OTP_SESSION=subnation-otp`)
+    // used to GET /api/sessions/subnation-otp → guaranteed 404 → list →
+    // resolve — two requests per probe, the first always doomed. Name
+    // lookup after the id miss makes the first request succeed; ids stay
+    // authoritative (a name that collides with an id shape still resolves
+    // by id first).
+    let rs = sessions.get(id);
+    if (!rs && id && !id.startsWith("sess_")) {
+        // RT-8 (R104 red team): malformed percent-sequences must 404, not 500.
+        let name = id;
+        try {
+            name = decodeURIComponent(id);
+        }
+        catch {
+            // keep the raw value — it will simply not match any session name
+        }
+        rs = findByName(name);
+    }
     if (!rs)
         res.status(404).json({ error: "session not found" });
     return rs;
@@ -516,8 +567,8 @@ mountDashboard(app, {
 // R97-04 (partial): in-memory sliding-window rate limits for the whole
 // /api surface — mounted BEFORE the X-API-Key gate so unauthenticated
 // key guessing is bounded per IP as well. /healthz lives outside /api
-// and stays exempt (the keep-alive self-ping and the SubNation backend
-// readiness probe must never be throttled).
+// and stays exempt (the SubNation backend readiness probe must never be
+// throttled — R104: the keep-alive self-ping was removed 2026-09-20).
 app.use("/api", createApiRateLimiter());
 app.use("/api", (req, res, next) => {
     if (!requireKey(req, res))
