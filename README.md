@@ -23,7 +23,7 @@ Lifecycle: `created → initializing → qr_ready → ready`
 
 | Var | Required | Meaning |
 | --- | --- | --- |
-| `OPENWA_API_KEY` | yes | shared secret for every `/api` call |
+| `OPENWA_API_KEY` | yes | shared secret for every `/api` call — the sole auth of the API surface, ≥ 32 chars recommended (`openssl rand -hex 32`; a boot warning fires below 32) |
 | `OPENWA_CREDENTIALS_KEY` | no | dedicated secret for encrypting persisted session credentials (`openssl rand -hex 32`, ≥ 32 chars recommended). **Unset = legacy derivation from `OPENWA_API_KEY`** — existing blobs decrypt with zero migration; when set, a blob that still decrypts with the old key is transparently re-encrypted on first read |
 | `PERSISTENCE_URL` | no | Postgres connection string — when set (together with `OPENWA_API_KEY`), session credentials are AES-256-GCM encrypted and persisted, so restarts/spin-downs restore pairings without a new QR scan |
 | `DATA_DIR` | no (default `/data`) | where Baileys credentials persist — **mount a disk here** so the scanned QR survives restarts |

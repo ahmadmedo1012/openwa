@@ -3,3 +3,15 @@ dist
 .git
 *.md
 data
+# FH-A2 P3-1: env files must never ship in the build context (the .env.example
+# exception mirrors .gitignore — the Dockerfile copies only package.json,
+# package-lock.json, tsconfig.json and src, so nothing below breaks the build).
+.env
+.env.*
+!.env.example
+# Test sources/artifacts — the image never runs tests (CI does, on a runner).
+tests
+coverage
+*.log
+npm-debug.log*
+.github

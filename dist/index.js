@@ -59,6 +59,12 @@ if (!API_KEY) {
     log.error("OPENWA_API_KEY is required — refusing to start (refusing an open relay)");
     process.exit(1);
 }
+// FH-A2 P3-2: the API key is the SOLE auth of the /api surface — timing-safe
+// compare and the pre-gate rate limits bound guessing speed, but key entropy
+// is what they defend. Warn (not refuse) so existing deployments keep booting.
+if (API_KEY.length < 32) {
+    log.warn({ length: API_KEY.length }, "[gateway] OPENWA_API_KEY is shorter than 32 chars — recommended: openssl rand -hex 32");
+}
 const SESSION_NAME_RE = /^[A-Za-z0-9-]{3,50}$/;
 // ── Registry ─────────────────────────────────────────────────────────────────
 /** R104 (AG7-4): 24 h in-process cache for the baileys version registry. */

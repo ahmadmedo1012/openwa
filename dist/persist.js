@@ -87,7 +87,28 @@ async function ensurePool() {
     if (!PERSISTENCE_URL || !API_KEY)
         return null;
     if (!pool) {
-        pool = new Pool({ connectionString: PERSISTENCE_URL, max: 2 });
+        // FH-A5 P3-1 (Neon autosuspend hygiene): an idle client killed by a TCP
+        // reset or a Neon suspend race surfaces as a pool 'error' event — without
+        // a listener it escapes as an uncaughtException (process-level guard logs
+        // it, but as a crash-look-alike). Logging here keeps the signal clean and
+        // lets the pool replace the dead client on the next acquire.
+        // statement_timeout 10s: every query here is a single-row upsert/select
+        // against a tiny table (slowest legitimate case ≈ boot DDL on a cold,
+        // just-woken Neon ~2s) — 10s is comfortable headroom while guaranteeing a
+        // hung query can never pin one of only 2 clients. idleTimeout 30s ≪
+        // Neon's ~5-min autosuspend closes idle clients proactively; keepalives
+        // keep a live connection from being silently dropped mid-flight.
+        pool = new Pool({
+            connectionString: PERSISTENCE_URL,
+            max: 2,
+            statement_timeout: 10_000,
+            idleTimeoutMillis: 30_000,
+            keepAlive: true,
+            keepAliveInitialDelayMillis: 30_000,
+        });
+        pool.on("error", (err) => {
+            log.error({ err }, "[persist] pool error (idle client dropped? pool will recover)");
+        });
         await pool.query(`
       CREATE TABLE IF NOT EXISTS openwa_sessions (
         name       TEXT PRIMARY KEY,
