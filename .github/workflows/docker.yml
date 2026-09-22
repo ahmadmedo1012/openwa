@@ -1,0 +1,73 @@
+# R107 (Oracle/Coolify migration): multi-arch Docker image for the openwa
+# WhatsApp gateway (linux/amd64 + linux/arm64 → GHCR).
+#
+# This repo is PUBLIC → GitHub-hosted runners (including native arm64) are
+# free and unmetered. The gateway image is tiny (npm ci + tsc, no Chromium —
+# Baileys is pure WebSocket), so even QEMU-emulated arm64 builds stay quick.
+#
+# STATUS: NOT YET VERIFIED end-to-end (no Docker in the r107 workspace).
+# Validate with one manual workflow_dispatch run before relying on it.
+name: Docker Image (multi-arch)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern=latest
+            type=sha,prefix=sha-
+            type=ref,event=branch
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=multi-arch
+          cache-to: type=gha,scope=multi-arch,mode=max

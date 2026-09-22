@@ -1,1 +1,12 @@
 node_modules/
+
+# R107 (secrets hygiene): never track env files or local session state.
+# The gateway reads OPENWA_API_KEY / PERSISTENCE_URL / etc. from the
+# environment — a stray `cp config .env` in this workdir must not become
+# a committable file.
+.env
+.env.*
+!.env.example
+
+# Local gateway session data (Docker mounts /data; local dev uses ./data)
+data/
