@@ -1,4 +1,4 @@
-# CI (FH-A12 F-6): the gateway's 80 tests (5 files, node --test) previously
+# CI (FH-A12 F-6): the gateway's 87 tests (6 files, node --test) previously
 # ran only as a manual `npm test` — gateway drift could break SubNation's
 # OTP login with no signal, because the SubNation backend consumes this
 # repo's REST contract. This repo is PUBLIC → GitHub-hosted runners are free
@@ -7,8 +7,9 @@
 # `npm test` = `npm run build && node --test tests/*.mjs`: the build step
 # (tsc, strict) doubles as the typecheck — there is no separate typecheck or
 # lint script in package.json. Tests are offline: no DATABASE_URL or live
-# Postgres needed (persist-key-separation reloads dist/persist.js with
-# PERSISTENCE_URL=""). Production parity: node 22 = the Dockerfile base
+# Postgres needed (persist-key-separation and persist-hardening reload
+# dist/persist.js with PERSISTENCE_URL="" or a fake pool). Production parity:
+# node 22 = the Dockerfile base
 # (node:22-alpine); package manager = npm (package-lock.json, npm ci —
 # same as the Dockerfile build stage).
 name: CI
@@ -43,5 +44,5 @@ jobs:
       - name: Install (lockfile-faithful)
         run: npm ci --no-audit --no-fund
 
-      - name: Build (tsc = typecheck) + tests (80 cases)
+      - name: Build (tsc = typecheck) + tests (87 cases)
         run: npm test

@@ -4,8 +4,11 @@
 # ~60-90 MB of typescript/tsx/@types dead weight in every pull).
 FROM node:22-alpine AS build
 WORKDIR /app
-# git is required by npm when a dependency resolves from a git URL.
-RUN apk add --no-cache git
+# No git needed in this deps stage (110-K, corrects the stale R104 note):
+# npm >= 9.6 resolves full-SHA GitHub git deps (libsignal-node) as TARBALLS
+# — no git binary, no ssh. Proven empirically in R109 (a cold-cache npm ci
+# with a broken git stub exits 0), and the deps-prod stage below has never
+# had git yet installs the same dependency.
 # Lockfile copied → reproducible resolution + faster installs.
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund

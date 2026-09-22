@@ -50,6 +50,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Tag scheme: immutable `sha-<short>` (one per commit — the
+      # RECOMMENDED pull tag; the SubNation compose policy pins it, see
+      # README § Docker), semver `X.Y.Z` + `latest` on `v*` tags, and the
+      # FLOATING `main` branch alias. Pulls should be sha-pinned for
+      # reproducible/rollback-able deployments.
       - name: Docker metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@v5

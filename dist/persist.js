@@ -98,9 +98,15 @@ async function ensurePool() {
         // hung query can never pin one of only 2 clients. idleTimeout 30s ≪
         // Neon's ~5-min autosuspend closes idle clients proactively; keepalives
         // keep a live connection from being silently dropped mid-flight.
+        // connectionTimeoutMillis 10s (110-K, 109-e P3; pg default = NO timeout):
+        // a hung CONNECT (DNS blackhole, silently-dropped SYN) must never pin
+        // one of only 2 clients for the process lifetime — 10s matches the
+        // statement_timeout scale, and a legitimate cold-Neon connect (~2s)
+        // keeps comfortable headroom.
         pool = new Pool({
             connectionString: PERSISTENCE_URL,
             max: 2,
+            connectionTimeoutMillis: 10_000,
             statement_timeout: 10_000,
             idleTimeoutMillis: 30_000,
             keepAlive: true,
@@ -135,26 +141,67 @@ const lastSavedAt = new Map();
  * شاهد قبر يمنع إنعاش بيانات اعتماد ميتة بعد المسح.
  */
 const wipedAt = new Map();
+/**
+ * WA-02 write serialization (110-K, closes the guard2→upsert window): a
+ * per-name FIFO promise chain for every DB mutation (save upsert, wipe
+ * DELETE). Node's single thread interleaves async operations at await
+ * points — WITHOUT the chain, a save that had already passed both
+ * tombstone guards could still land its upsert AFTER a wipe's DELETE
+ * completed (the await between guard2 and the upsert is the window; a
+ * cold just-woken Neon can park an upsert for seconds) and resurrect the
+ * dead row. WITH the chain, the DELETE queues behind the in-flight
+ * upsert and lands last — the wipe ALWAYS wins. The tombstone guards
+ * above stay: they kill saves that were only REQUESTED before the wipe
+ * without wasting a query. (The legacy re-key path needs no chain — it
+ * is a plain `UPDATE … WHERE name = $1`, which can never re-INSERT a
+ * deleted row; pinned by a test.)
+ * سلسلة وعود لكل اسم: المسح ينتصر دائمًا على الحفظ المتقادم.
+ */
+const writeChains = new Map();
+function orderedWrites(name, op) {
+    const prev = writeChains.get(name) ?? Promise.resolve();
+    const run = prev.then(op, op); // run even if the previous op rejected
+    // The chain tail never rejects (later ops must always run); the map
+    // entry is dropped once nothing newer queued behind it — bounded map
+    // across many delete/re-pair cycles, same discipline as the wipedAt
+    // tombstone pruning.
+    const tail = run.then(() => {
+        if (writeChains.get(name) === tail)
+            writeChains.delete(name);
+    }, () => {
+        if (writeChains.get(name) === tail)
+            writeChains.delete(name);
+    });
+    writeChains.set(name, tail);
+    return run;
+}
 /** Core save: serialize + encrypted upsert + bookkeeping. جوهر الحفظ. */
 async function doSave(name, serialize) {
-    const p = await ensurePool();
-    if (!p)
-        return;
+    // 110-K: startedAt + the chain entry are captured SYNCHRONOUSLY at
+    // request time (pre-await) so that (a) the WA-02 tombstone comparison
+    // anchors to the request instant, and (b) per-name DB mutations
+    // strictly follow CALL order — a wipe issued later can never be
+    // overtaken by this save's upsert.
     const startedAt = Date.now();
-    // Guard (pre-serialize): a wipe that already landed kills this save.
-    const wipe1 = wipedAt.get(name);
-    if (wipe1 != null && wipe1 >= startedAt)
-        return;
-    const json = await serialize();
-    // Guard (post-serialize): the folder read above may have raced a wipe.
-    const wipe2 = wipedAt.get(name);
-    if (wipe2 != null && wipe2 >= startedAt)
-        return;
-    await p.query(`INSERT INTO openwa_sessions (name, creds, updated_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (name) DO UPDATE SET creds = $2, updated_at = NOW()`, [name, encrypt(json)]);
-    lastSavedAt.set(name, Date.now());
-    log.info({ name }, "[persist] credentials saved");
+    await orderedWrites(name, async () => {
+        const p = await ensurePool();
+        if (!p)
+            return;
+        // Guard (pre-serialize): a wipe that already landed kills this save.
+        const wipe1 = wipedAt.get(name);
+        if (wipe1 != null && wipe1 >= startedAt)
+            return;
+        const json = await serialize();
+        // Guard (post-serialize): the folder read above may have raced a wipe.
+        const wipe2 = wipedAt.get(name);
+        if (wipe2 != null && wipe2 >= startedAt)
+            return;
+        await p.query(`INSERT INTO openwa_sessions (name, creds, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (name) DO UPDATE SET creds = $2, updated_at = NOW()`, [name, encrypt(json)]);
+        lastSavedAt.set(name, Date.now());
+        log.info({ name }, "[persist] credentials saved");
+    });
 }
 /**
  * Debounced save of one session's serialized auth state.
@@ -307,6 +354,36 @@ export async function listPersistedNames() {
     }
 }
 /**
+ * Restore-path hardening (110-K, 109-h P3): a filename key inside a stored
+ * credentials blob is only trusted after this check. The blob comes from
+ * the DATABASE — normally written by the gateway's own serializer from a
+ * genuine auth-folder listing, but a tampered or foreign blob must never be
+ * able to plant a file OUTSIDE the session dir (absolute path, `..`
+ * traversal, separators, NUL/control bytes) or under a >255-char name the
+ * filesystem would reject. The charset is deliberately wider than bare
+ * `[A-Za-z0-9._-]` because it must stay LOSSLESS for every filename the
+ * Baileys multi-file auth store produces (verified against its source —
+ * fixFileName only rewrites `/`→`__` and `:`→`-`):
+ *   creds.json · pre-key-<id> · session-<user>.<device>
+ *   sender-key-<groupJid>--<user>.<device>      (JIDs carry `@`)
+ *   sender-key-memory-<jid>                      (JIDs carry `@`)
+ *   app-state-sync-key-<base64>                 (base64 carries `+` `=`)
+ *   app-state-sync-version-<name>               (names carry `_`)
+ * `.`/`..` pass the charset and are rejected explicitly. Callers skip +
+ * log the FILENAME only (blob content is secret and never logged) and must
+ * not let one bad name abort the rest of the restore.
+ * فحص اسم الملف داخل البلوب قبل الكتابة — لا كتابة خارج مجلد الجلسة أبدًا.
+ */
+const BLOB_FNAME_RE = /^[A-Za-z0-9._@+=-]+$/;
+const BLOB_FNAME_MAX = 255; // Linux NAME_MAX per path component.
+export function isSafeBlobFilename(fname) {
+    return (fname.length > 0 &&
+        fname.length <= BLOB_FNAME_MAX &&
+        fname !== "." &&
+        fname !== ".." &&
+        BLOB_FNAME_RE.test(fname));
+}
+/**
  * Wipe the persisted credentials blob for a session (the local auth dir
  * is the caller's job). WA-02 hardening: cancels any pending debounced
  * save, tombstones the name (an in-flight save that started earlier can
@@ -324,10 +401,18 @@ export async function deletePersisted(name) {
     // open (same discipline as the rate-limit sweep timers).
     setTimeout(() => wipedAt.delete(name), 10 * 60_000).unref();
     try {
-        const p = await ensurePool();
-        if (!p)
-            return;
-        await p.query(`DELETE FROM openwa_sessions WHERE name = $1`, [name]);
+        // 110-K: the DELETE rides the SAME per-name write chain as the save
+        // upserts — an in-flight save that already passed the tombstone
+        // guards lands its upsert first, this DELETE lands right after it,
+        // and the row ends up gone. The tombstone (set above, synchronously)
+        // additionally kills any save that is merely REQUESTED later than
+        // this call.
+        await orderedWrites(name, async () => {
+            const p = await ensurePool();
+            if (!p)
+                return;
+            await p.query(`DELETE FROM openwa_sessions WHERE name = $1`, [name]);
+        });
     }
     catch {
         // best-effort
@@ -348,4 +433,17 @@ export function __cryptoForTest() {
         decryptLegacy: (blob) => decryptWith(blob, deriveKey(API_KEY)),
         legacyKeyAvailable,
     };
+}
+/**
+ * @internal Test-only surface for the 110-K WA-02 race tests: swaps the
+ * memoized pg pool for a fake. With PERSISTENCE_URL set to a dummy string,
+ * ensurePool() returns the fake WITHOUT touching a real database — the
+ * creation branch (pool `error` listener + boot DDL) is skipped whenever
+ * `pool` is already set. Returns the previous pool so tests can restore
+ * it. Never used by runtime code paths.
+ */
+export function __setPoolForTest(fake) {
+    const prev = pool;
+    pool = fake;
+    return prev;
 }

@@ -43,7 +43,7 @@ import { nanoid } from "nanoid";
 import { timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { persistenceEnabled, scheduleSave, flushNow, persistAge, loadCreds, listPersistedNames, deletePersisted, cancelPendingSave, } from "./persist.js";
+import { persistenceEnabled, scheduleSave, flushNow, persistAge, loadCreds, listPersistedNames, deletePersisted, cancelPendingSave, isSafeBlobFilename, } from "./persist.js";
 import { normalizeChatId, extractAccountDigits, extractLidDigits, resolveSendJid, mergeDeliveryTimeline, pushDeliveryLog, advanceDeliveryStatus, applyConnectionClose, asyncHandler, beginSessionStart, maskDigits, maskJid, } from "./lib.js";
 import { createApiRateLimiter } from "./rate-limit.js";
 import { mountDashboard } from "./dashboard-routes.js";
@@ -123,6 +123,17 @@ async function startSession(rs) {
                     await fs.mkdir(dir, { recursive: true });
                     const creds = JSON.parse(blob);
                     for (const [fname, content] of Object.entries(creds)) {
+                        // 110-K (109-h P3): the blob comes from the DB — validate every
+                        // filename BEFORE writing it (see isSafeBlobFilename in
+                        // persist.ts). A tampered/foreign blob must never plant a file
+                        // outside the session dir via an absolute path, `..` traversal
+                        // or separators. Skip + warn on the FILENAME only (blob content
+                        // is secret and never logged); one bad name must not abort the
+                        // rest of the restore, and the restore must not crash the boot.
+                        if (!isSafeBlobFilename(fname)) {
+                            log.warn({ sessionId: rs.id, name: rs.name, fname: fname.slice(0, 64) }, "[persist] restore skipped a suspicious blob filename (path-traversal guard)");
+                            continue;
+                        }
                         await fs.writeFile(path.join(dir, fname), typeof content === "string" ? content : JSON.stringify(content));
                     }
                     log.info({ sessionId: rs.id, name: rs.name }, "[persist] credentials restored from DB");

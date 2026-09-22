@@ -41,3 +41,23 @@ Lifecycle: `created → initializing → qr_ready → ready`
 
 Credentials live in `${DATA_DIR}/sessions/<name>/` — never delete that folder
 unless you want to pair again from scratch.
+
+## Docker
+
+CI publishes a multi-arch (linux/amd64 + linux/arm64) image to GHCR on
+every push to `main` and on `v*` tags (`.github/workflows/docker.yml`):
+
+    ghcr.io/ahmadmedo1012/openwa
+
+**Pull it sha-pinned.** Every build publishes an immutable `sha-<short>`
+tag (one commit → one digest, never overwritten) — this is the tag the
+SubNation compose policy pins and the one to use for reproducible
+deployments:
+
+    docker pull ghcr.io/ahmadmedo1012/openwa:sha-<short>   # immutable — pin this
+
+The `:main` alias (and `:latest` / `:1.2.3` when a version tag exists) is
+a FLOATING tag that silently moves with every build — fine for a quick
+look, wrong for anything you want to be able to reproduce or roll back.
+Run it with a volume mounted at `DATA_DIR` (`/data` in the image) and the
+environment variables above.
