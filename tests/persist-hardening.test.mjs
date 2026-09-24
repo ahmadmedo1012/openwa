@@ -116,11 +116,37 @@ function makeFakePool() {
       return { rowCount: 0, rows: [] };
     },
   };
+  // O2-F5 (R111): flushNow's upsert now runs on a DEDICATED client inside a
+  // transaction (BEGIN / SET LOCAL statement_timeout / INSERT / COMMIT).
+  // The fake client swallows the transaction plumbing (recorded separately
+  // in clientQueries) and delegates the INSERT itself to the shared pool
+  // path, so the parking-gate semantics the race tests below rely on stay
+  // intact — `entered`/`landed` keep seeing exactly the insert/delete/etc.
+  // ops they always did.
+  const clientQueries = [];
+  const client = {
+    async query(sql, params) {
+      const text = String(sql).trim();
+      clientQueries.push(text);
+      if (
+        text.startsWith("BEGIN") ||
+        text.startsWith("SET LOCAL") ||
+        text.startsWith("COMMIT") ||
+        text.startsWith("ROLLBACK")
+      ) {
+        return { rowCount: 0 };
+      }
+      return pool.query(sql, params);
+    },
+    release() {},
+  };
+  pool.connect = async () => client;
   return {
     pool,
     rows,
     entered,
     landed,
+    clientQueries,
     parkInserts() {
       insertGate = new Promise((r) => {
         insertGateRelease = r;

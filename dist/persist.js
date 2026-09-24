@@ -175,8 +175,18 @@ function orderedWrites(name, op) {
     writeChains.set(name, tail);
     return run;
 }
+/**
+ * The single upsert every save path lands (debounced background saves AND
+ * the bounded flush path below share it — the WA-02 chain + tombstone
+ * guards around it are what keep a wipe always winning).
+ * الإدراج-التحديث الموحّد لكل مسارات الحفظ.
+ */
+const UPSERT_SQL = `
+  INSERT INTO openwa_sessions (name, creds, updated_at)
+  VALUES ($1, $2, NOW())
+  ON CONFLICT (name) DO UPDATE SET creds = $2, updated_at = NOW()`;
 /** Core save: serialize + encrypted upsert + bookkeeping. جوهر الحفظ. */
-async function doSave(name, serialize) {
+async function doSave(name, serialize, opts = {}) {
     // 110-K: startedAt + the chain entry are captured SYNCHRONOUSLY at
     // request time (pre-await) so that (a) the WA-02 tombstone comparison
     // anchors to the request instant, and (b) per-name DB mutations
@@ -196,9 +206,32 @@ async function doSave(name, serialize) {
         const wipe2 = wipedAt.get(name);
         if (wipe2 != null && wipe2 >= startedAt)
             return;
-        await p.query(`INSERT INTO openwa_sessions (name, creds, updated_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (name) DO UPDATE SET creds = $2, updated_at = NOW()`, [name, encrypt(json)]);
+        if (opts.flushStatementTimeoutMs != null) {
+            // O2-F5 (R111): bounded flush — the flush path (SIGTERM/SIGINT + the
+            // disconnect snapshot) runs its upsert on a DEDICATED client inside a
+            // transaction with a transaction-local statement_timeout, so a stuck
+            // write fails fast instead of eating the whole shutdown budget (the
+            // pool-level 10s is larger than it). SET LOCAL cannot leak past the
+            // COMMIT/ROLLBACK to other pooled queries. حد أقصى 3 ثوان لاستعلام
+            // التدفّق النهائي داخل معاملة محلية.
+            const client = await p.connect();
+            try {
+                await client.query("BEGIN");
+                await client.query(`SET LOCAL statement_timeout = ${Math.floor(opts.flushStatementTimeoutMs)}`);
+                await client.query(UPSERT_SQL, [name, encrypt(json)]);
+                await client.query("COMMIT");
+            }
+            catch (err) {
+                await client.query("ROLLBACK").catch(() => { });
+                throw err;
+            }
+            finally {
+                client.release();
+            }
+        }
+        else {
+            await p.query(UPSERT_SQL, [name, encrypt(json)]);
+        }
         lastSavedAt.set(name, Date.now());
         log.info({ name }, "[persist] credentials saved");
     });
@@ -241,7 +274,13 @@ export function cancelPendingSave(name) {
  * Used by the SIGTERM/SIGINT shutdown flush and the disconnect path —
  * a debounced save would die with the process.
  * إلغاء الـ debounce المعلّق وتنفيذ الحفظ فورًا.
+ *
+ * O2-F5 (R111): the flush's OWN upsert runs with a 3s transaction-local
+ * statement_timeout (see doSave) — the shutdown budget is smaller than the
+ * pool-level 10s, so a stuck upsert must fail fast instead of hanging the
+ * process into the SIGKILL and losing the last signal state anyway.
  */
+const FLUSH_STATEMENT_TIMEOUT_MS = 3_000;
 export async function flushNow(name, serialize) {
     if (!persistenceEnabled())
         return;
@@ -251,7 +290,7 @@ export async function flushNow(name, serialize) {
         pending.delete(name);
     }
     try {
-        await doSave(name, serialize);
+        await doSave(name, serialize, { flushStatementTimeoutMs: FLUSH_STATEMENT_TIMEOUT_MS });
     }
     catch (err) {
         log.warn({ err, name }, "[persist] flush failed");

@@ -1,4 +1,4 @@
-# CI (FH-A12 F-6): the gateway's 87 tests (6 files, node --test) previously
+# CI (FH-A12 F-6): the gateway's tests (7 files, node --test) previously
 # ran only as a manual `npm test` — gateway drift could break SubNation's
 # OTP login with no signal, because the SubNation backend consumes this
 # repo's REST contract. This repo is PUBLIC → GitHub-hosted runners are free
@@ -44,5 +44,12 @@ jobs:
       - name: Install (lockfile-faithful)
         run: npm ci --no-audit --no-fund
 
-      - name: Build (tsc = typecheck) + tests (87 cases)
+      # O1-M3 (R111): supply-chain gate — the audit is clean as of R111
+      # (qs 6.16.0 via express 4.22.3, sharp 0.35.4 past the libheif high);
+      # this step keeps it that way: any future high+ advisory in a PROD
+      # dependency fails CI instead of shipping silently.
+      - name: Supply-chain audit (prod deps, high+)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Build (tsc = typecheck) + tests (103 cases)
         run: npm test

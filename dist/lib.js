@@ -248,3 +248,68 @@ export function applyConnectionClose(rs, close, fx) {
     fx.scheduleReconnect();
     return "disconnected";
 }
+// ── TRUST_PROXY knob (R111, O1-M4) ──────────────────────────────────────────
+/**
+ * Forwarded-identity trust switch, shared by the /api rate limiter
+ * (rate-limit.ts) and the dashboard login lockout (dashboard.ts).
+ *
+ *   TRUST_PROXY=0|false|off|no → X-Forwarded-For and CF-Connecting-IP are
+ *       NEVER trusted: the socket remote address is the whole client
+ *       identity. For DIRECT-publish deployments (no trusted reverse
+ *       proxy in front — e.g. a raw published port): with XFF trust on, a
+ *       forged single-entry X-Forwarded-For hands the attacker an
+ *       attacker-chosen identity → unlimited rate-limit bucket splitting
+ *       and lockout bypass.
+ *   unset (or any other value) → the current deployment posture is kept:
+ *       the RIGHTMOST XFF entry is trusted (Render's edge appends the
+ *       true peer there; compose traffic is loopback-direct with no XFF
+ *       at all). The default must stay trusting, otherwise every Render
+ *       client would collapse into the edge proxy's shared buckets.
+ *
+ * Read per-call (no import-time snapshot) so tests can flip it live.
+ * مفتاح الوكيل الموثوق: تعطيل ترويسات التحويل عند النشر المباشر.
+ */
+export function trustForwardedHeaders() {
+    const raw = (process.env.TRUST_PROXY ?? "").trim().toLowerCase();
+    return !(raw === "0" || raw === "false" || raw === "off" || raw === "no");
+}
+// ── Restore-gate decision (R111, O2-F1) ─────────────────────────────────────
+/**
+ * Should the DB credentials blob be restored over the LOCAL auth folder at
+ * session start? The old gate restored only when local creds.json did not
+ * EXIST — interim pairing creds (registered !== true, written by an
+ * interrupted pairing while the DB still held the good registered blob)
+ * permanently shadowed the restore on persistent volumes: QR refs
+ * exhausted → timedOut close → backoff → fresh QR → an infinite qr_ready
+ * loop, and the operator's only dashboard fix (DELETE) destroyed the good
+ * row too. The DB only ever stores post-ready snapshots ("no persist
+ * before ready"), so it is preferred whenever the local state is absent
+ * OR not fully registered.
+ * بوابة الاسترجاع: يُفضَّل بلوب قاعدة البيانات على بيانات محلية غائبة أو
+ * غير مسجلة (ناقصة الاقتران).
+ */
+export function shouldPreferDbBlobOverLocal(localHasCreds, localRegistered) {
+    return !localHasCreds || !localRegistered;
+}
+// ── Terminal error status (R111, O2-F6) ─────────────────────────────────────
+/**
+ * Status code for the terminal error middleware: body-parser rejections
+ * (the 256kb JSON limit) carry statusCode 413, and http-errors-convention
+ * errors carry `status` — the old blanket 500 misreported an oversized
+ * CLIENT payload as a server fault. The first sane 4xx/5xx code found
+ * wins (statusCode before status, the body-parser convention); anything
+ * else (plain Error, junk/non-integer/out-of-range values) stays a
+ * generic 500. كود حالة الخطأ الطرفي: يُحترم كود المحلل إن وُجد وإلا 500 عام.
+ */
+export function httpErrorStatus(err) {
+    const raw = err;
+    for (const candidate of [raw?.statusCode, raw?.status]) {
+        if (typeof candidate === "number" &&
+            Number.isInteger(candidate) &&
+            candidate >= 400 &&
+            candidate <= 599) {
+            return candidate;
+        }
+    }
+    return 500;
+}

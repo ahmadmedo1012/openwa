@@ -9,13 +9,13 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "npm run build && node --test tests/lib.test.mjs tests/rate-limit.test.mjs tests/logged-out-reset.test.mjs tests/persist-key-separation.test.mjs tests/gateway-hardening.test.mjs tests/persist-hardening.test.mjs"
+    "test": "npm run build && node --test tests/lib.test.mjs tests/rate-limit.test.mjs tests/logged-out-reset.test.mjs tests/persist-key-separation.test.mjs tests/gateway-hardening.test.mjs tests/persist-hardening.test.mjs tests/r111-hardening.test.mjs"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
+    "@whiskeysockets/baileys": "^6.7.22",
     "express": "^4.21.2",
     "nanoid": "^5.0.9",
     "pg": "^8.23.0",

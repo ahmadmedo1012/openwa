@@ -28,6 +28,7 @@ Lifecycle: `created → initializing → qr_ready → ready`
 | `PERSISTENCE_URL` | no | Postgres connection string — when set (together with `OPENWA_API_KEY`), session credentials are AES-256-GCM encrypted and persisted, so restarts/spin-downs restore pairings without a new QR scan |
 | `DATA_DIR` | no (default `/data`) | where Baileys credentials persist — **mount a disk here** so the scanned QR survives restarts |
 | `PORT` | no (default 2785) | listen port |
+| `TRUST_PROXY` | no (default: trust) | forwarded-identity trust for the `/api` rate limits and the dashboard login lockout. Default (unset) trusts the RIGHTMOST `X-Forwarded-For` entry — correct behind Render's edge and on loopback-direct compose. **Set `TRUST_PROXY=0` when the port is published DIRECTLY** (no reverse proxy in front, e.g. a raw Coolify port mapping): otherwise a forged `X-Forwarded-For` header hands an attacker an attacker-chosen identity (unlimited rate-limit bucket splitting + lockout bypass) |
 
 ## Pairing a session
 

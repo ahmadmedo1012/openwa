@@ -44,7 +44,7 @@ import { timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { persistenceEnabled, scheduleSave, flushNow, persistAge, loadCreds, listPersistedNames, deletePersisted, cancelPendingSave, isSafeBlobFilename, } from "./persist.js";
-import { normalizeChatId, extractAccountDigits, extractLidDigits, resolveSendJid, mergeDeliveryTimeline, pushDeliveryLog, advanceDeliveryStatus, applyConnectionClose, asyncHandler, beginSessionStart, maskDigits, maskJid, } from "./lib.js";
+import { normalizeChatId, extractAccountDigits, extractLidDigits, resolveSendJid, mergeDeliveryTimeline, pushDeliveryLog, advanceDeliveryStatus, applyConnectionClose, asyncHandler, beginSessionStart, httpErrorStatus, maskDigits, maskJid, shouldPreferDbBlobOverLocal, } from "./lib.js";
 import { createApiRateLimiter } from "./rate-limit.js";
 import { mountDashboard } from "./dashboard-routes.js";
 import { dashboardEnabled } from "./dashboard.js";
@@ -117,9 +117,36 @@ async function startSession(rs) {
             const dir = `${DATA_DIR}/sessions/${rs.name}`;
             const existing = await fs.readdir(dir).catch(() => []);
             const hasCreds = existing.includes("creds.json");
-            if (!hasCreds) {
+            // O2-F1 (R111): INTERIM local creds (registered !== true, written by
+            // an interrupted pairing while the DB still held the good registered
+            // blob) used to permanently shadow the restore on persistent
+            // volumes — the old gate tested creds.json EXISTENCE only, so the
+            // boot self-heal looped qr_ready forever while the registered blob
+            // sat unused in the DB. The DB only ever stores post-ready snapshots
+            // (the "no persist before ready" gate), so it is preferred whenever
+            // the local state is absent OR not fully registered. يُفضَّل بلوب
+            // قاعدة البيانات على بيانات اعتماد محلية غير مسجلة.
+            let localRegistered = false;
+            if (hasCreds) {
+                try {
+                    const raw = await fs.readFile(path.join(dir, "creds.json"), "utf8");
+                    localRegistered = Boolean(JSON.parse(raw)?.registered);
+                }
+                catch {
+                    localRegistered = false; // unreadable local creds → treat as interim
+                }
+            }
+            if (shouldPreferDbBlobOverLocal(hasCreds, localRegistered)) {
                 const blob = await loadCreds(rs.name);
                 if (blob) {
+                    if (hasCreds) {
+                        // The interim folder also holds pre-keys/sessions the
+                        // registered blob knows nothing about — a MIXED folder is not
+                        // a valid auth state, so wipe it first: the restore below then
+                        // rewrites the folder byte-identically to the fresh path.
+                        await fs.rm(dir, { recursive: true, force: true }).catch(() => { });
+                        log.warn({ sessionId: rs.id, name: rs.name }, "[persist] interim local credentials replaced by the DB blob (O2-F1)");
+                    }
                     await fs.mkdir(dir, { recursive: true });
                     const creds = JSON.parse(blob);
                     for (const [fname, content] of Object.entries(creds)) {
@@ -184,7 +211,11 @@ async function startSession(rs) {
     version = versionCache;
     if (!version) {
         try {
-            const latest = await fetchLatestBaileysVersion();
+            // O2-F3 (R111): axios defaults to NO timeout — a black-holed registry
+            // fetch stalled this session start (and, in the serial boot loop,
+            // every session behind it) for as long as the OS held the socket.
+            // 3s bound; baileys' own baked-in version is the fallback on failure.
+            const latest = await fetchLatestBaileysVersion({ timeout: 3_000 });
             version = latest.version;
             versionCache = version;
             versionCacheAt = Date.now();
@@ -208,6 +239,22 @@ async function startSession(rs) {
         syncFullHistory: false,
     });
     rs.socket = sock;
+    // O1-M1 (R111): a DELETE that landed while this start was still in
+    // flight has already set stopRequested (the reset at the top of
+    // startSession ran BEFORE the delete, and rs.socket was not yet
+    // assigned — so the deleter's socket?.end() no-oped). End the freshly
+    // created socket right now: the close handler below sees stopRequested
+    // and runs the failed+wipe path, so the start can never go on to open a
+    // connection on a detached record (persist gates reopen → upsert lands
+    // after the tombstone → the deleted row resurrects).
+    if (rs.stopRequested) {
+        try {
+            sock.end(undefined);
+        }
+        catch {
+            // already dead
+        }
+    }
     const persistSnapshot = () => {
         if (!persistenceEnabled() || !rs.lastReadyAt)
             return;
@@ -338,6 +385,19 @@ async function startSession(rs) {
             return;
         }
         if (connection === "close") {
+            // O2-F4 (R111): a LATE close from a superseded socket (a reconnect
+            // already opened a new one on this record) must never run the close
+            // reducer — it would clobber the live registration, mark the session
+            // disconnected and arm a SECOND start on the same auth folder;
+            // WhatsApp answers that conflict with loggedOut → credential wipe.
+            // Only the CURRENT socket's close is processed (undefined ⇒ a close
+            // was already processed for the previous socket — a duplicate close
+            // is equally stale). إغلاق متقادم من سوكت مستبدَل يُتجاهل — لا
+            // يُعالَج إلا إغلاق السوكت الحالي.
+            if (rs.socket !== sock) {
+                log.warn({ sessionId: rs.id, name: rs.name }, "[session] stale close from a superseded socket ignored");
+                return;
+            }
             const code = lastDisconnect?.error
                 ?.output?.statusCode;
             const loggedOut = code === DisconnectReason.loggedOut;
@@ -384,7 +444,13 @@ async function startSession(rs) {
                         if (!cur || cur.stopRequested || cur.status !== "disconnected")
                             return;
                         cur.status = "initializing";
-                        void beginSessionStart(cur, () => startSession(cur)).catch((err) => log.error({ err, sessionId: rs.id }, "[session] reconnect failed"));
+                        // O2-F2 (R111): mirror the /start route — a failed engine
+                        // start must land on "failed", not wedge at initializing
+                        // forever (no socket ⇒ no close event ⇒ nothing re-arms).
+                        void beginSessionStart(cur, () => startSession(cur)).catch((err) => {
+                            cur.status = "failed";
+                            log.error({ err, sessionId: rs.id }, "[session] reconnect failed");
+                        });
                     }, delay);
                     timer.unref?.();
                 },
@@ -519,6 +585,14 @@ function toDashboardView(rs) {
         qrString: () => rs.qrString ?? null,
         async delete() {
             rs.stopRequested = true;
+            // O1-M1 (R111): a start still in flight has not assigned rs.socket
+            // yet — end() would no-op and the background start would go on to
+            // open a connection on a detached record (persist gates reopen →
+            // upsert after the tombstone → resurrection). Await the in-flight
+            // start (bounded: it settles once handlers are wired — it never
+            // waits for the connection itself), then end the now-assigned
+            // socket. يُنتظر البدء الجاري قبل إنهاء السوكت.
+            await rs.starting?.catch(() => { });
             try {
                 rs.socket?.end(undefined);
             }
@@ -757,6 +831,11 @@ app.delete("/api/sessions/:id", asyncHandler(async (req, res) => {
         return;
     try {
         rs.stopRequested = true;
+        // O1-M1 (R111): await any in-flight start BEFORE ending the socket —
+        // the delete twin of the dashboard path above (socket not yet
+        // assigned ⇒ end() no-ops and the detached start resurrects the
+        // row). قبل الإنهاء يُنتظر البدء الجاري إن وُجد.
+        await rs.starting?.catch(() => { });
         rs.socket?.end(undefined);
     }
     catch {
@@ -900,16 +979,22 @@ app.use("/api", (_req, res) => res.status(404).json({ error: "not found" }));
 // forever (the process guard only LOGS unhandledRejection). Covers the
 // dashboard router too: mountDashboard registers its routes on THIS app
 // (no separate express instance), and requireAuth forwards `next` for
-// exactly that reason. Generic 500 body — the real error goes to pino,
-// never to the response. headersSent → delegate to Express's default
+// exactly that reason. The body stays generic — the real error goes to
+// pino, never to the response. headersSent → delegate to Express's default
 // final handler (it safely destroys the stream).
 app.use((err, _req, res, next) => {
-    log.error({ err }, "[http] unhandled error — answered with 500");
+    // O2-F6 (R111): body-parser rejections (the 256kb JSON limit) carry
+    // statusCode 413 — the old blanket 500 misreported an oversized CLIENT
+    // payload as a server fault. Honor the status code the error already
+    // chose (httpErrorStatus: statusCode/status, sane 4xx/5xx only);
+    // anything else stays a generic 500.
+    const status = httpErrorStatus(err);
+    log.error({ err, status }, "[http] unhandled error — answered generically");
     if (res.headersSent) {
         next(err);
         return;
     }
-    res.status(500).json({ error: "internal" });
+    res.status(status).json({ error: status === 413 ? "payload_too_large" : "internal" });
 });
 app.listen(PORT, "0.0.0.0", async () => {
     log.info({ port: PORT, dataDir: DATA_DIR }, "[gateway] listening");
@@ -934,6 +1019,17 @@ app.listen(PORT, "0.0.0.0", async () => {
         for (const name of names) {
             if (findByName(name))
                 continue;
+            // O1-M2 (R111): names read from the DB get the SAME validation as
+            // POST create + the dashboard (SESSION_NAME_RE). r110 hardened the
+            // blob FILENAMES but not the name column, which is joined into
+            // filesystem paths below — path.join normalizes `..` (verified →
+            // /data/evil). Defense-in-depth (needs a DB write to exploit);
+            // skip + warn mirrors the restore-path pattern. فحص اسم الجلسة
+            // القادم من قاعدة البيانات قبل الاسترجاع الذاتي.
+            if (!SESSION_NAME_RE.test(name)) {
+                log.warn({ name: name.slice(0, 64) }, "[boot] persisted session name failed SESSION_NAME_RE — skipped (path-traversal guard)");
+                continue;
+            }
             const rs = {
                 id: `sess_${nanoid(16)}`,
                 name,
@@ -943,7 +1039,12 @@ app.listen(PORT, "0.0.0.0", async () => {
             sessions.set(rs.id, rs);
             // P2-2 single-flight: a manual /start or dash start racing the boot
             // restore awaits the SAME in-flight start, never a second socket.
-            await beginSessionStart(rs, () => startSession(rs)).catch((err) => log.error({ err, name }, "[boot] auto-restore failed"));
+            await beginSessionStart(rs, () => startSession(rs)).catch((err) => {
+                // O2-F2 (R111): land on "failed" (same as the /start route) — the
+                // boot loop must never leave a permanently-"initializing" session.
+                rs.status = "failed";
+                log.error({ err, name }, "[boot] auto-restore failed");
+            });
             log.info({ name }, "[boot] session restored from persistence");
         }
     }
@@ -964,11 +1065,17 @@ process.on("unhandledRejection", (reason) => {
 // Render sends SIGTERM before killing the instance (deploy / spin-down).
 // Pending debounced saves (300ms / 3s) would die with the process, so the
 // next boot would restore a STALE snapshot → decryption failures on the
-// phone ("Waiting for this message"). Flush every ready session now,
-// bounded by a 4s total budget, then exit cleanly.
+// phone ("Waiting for this message"). Flush every ready session now, then
+// exit cleanly.
 // تدفّق نهائي عند الإيقاف: حفظ كل جلسة جاهزة قبل الخروج.
+// O2-F5 (R111): budget 10s (the compose SIGTERM grace is 15s — this stays
+// under it with room for exit overhead) and each flush's OWN upsert runs
+// with a 3s transaction-local statement_timeout (persist.ts flushNow), so
+// a single stuck write cannot eat the whole budget. The old 4s budget
+// lost the race against the pool-level 10s statement_timeout: a flush
+// queued behind a stuck upsert simply never ran.
 let isShuttingDown = false;
-const SHUTDOWN_FLUSH_BUDGET_MS = 4_000;
+const SHUTDOWN_FLUSH_BUDGET_MS = 10_000;
 async function shutdownFlush(signal) {
     if (isShuttingDown)
         return; // a second signal must never double-flush

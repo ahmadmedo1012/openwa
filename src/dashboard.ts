@@ -24,6 +24,7 @@
  */
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type express from "express";
+import { trustForwardedHeaders } from "./lib.js";
 
 const DASHBOARD_USERNAME = (process.env.DASHBOARD_USERNAME ?? "").trim().toLowerCase();
 const DASHBOARD_PASSWORD = (process.env.DASHBOARD_PASSWORD ?? "").trim();
@@ -97,6 +98,13 @@ const LOCK_MS = 15 * 60 * 1000;
 const attempts = new Map<string, { fails: number[]; lockedUntil: number }>();
 
 function clientIp(req: express.Request): string {
+  // O1-M4 (R111): TRUST_PROXY=0|false → the socket address IS the identity
+  // (direct-publish deployments — a forged single-entry XFF would otherwise
+  // rotate the lockout key at will). Default keeps the rightmost-XFF trust.
+  // مع TRUST_PROXY=0 يُصبح عنوان السوكت هو الهوية كاملةً.
+  if (!trustForwardedHeaders()) {
+    return req.socket.remoteAddress || "unknown";
+  }
   // SEC1/P1-1: the FIRST x-forwarded-for entry is client-spoofable
   // (proven live on Render — rotating a forged first entry defeated the
   // lockout). Render's edge APPENDS the real client IP, so the LAST

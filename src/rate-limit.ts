@@ -26,6 +26,7 @@
  * في XFF ضمن نطاقات Cloudflare).
  */
 import type { NextFunction, Request, Response } from "express";
+import { trustForwardedHeaders } from "./lib.js";
 
 // ── Cloudflare published ranges (cloudflare.com/ips-v4 & ips-v6) ─────────────
 // Same tables as SubNation's backend/src/middlewares/cloudflareClientIp.ts —
@@ -171,8 +172,18 @@ export function renderFacingPeer(req: IpRequestLike): string | null {
  * Resolve the client IP for rate-limit keys:
  * CF-Connecting-IP (only via a verified Cloudflare hop) → rightmost XFF
  * (Render's appended peer) → socket address → "unknown".
+ *
+ * O1-M4 (R111): with TRUST_PROXY=0|false (direct-publish deployments —
+ * no trusted reverse proxy in front) the forwarded headers are NEVER
+ * consulted: the socket remote address is the whole identity. A forged
+ * single-entry XFF would otherwise hand the attacker an attacker-chosen
+ * key (unlimited bucket splitting). Default (unset) keeps the Render
+ * posture above. مع TRUST_PROXY=0 لا تُقرأ ترويسات التحويل إطلاقًا.
  */
 export function resolveClientIp(req: IpRequestLike): string {
+  if (!trustForwardedHeaders()) {
+    return req.socket?.remoteAddress ?? "unknown";
+  }
   const peer = renderFacingPeer(req);
   const cfIp = headerValue(req, "cf-connecting-ip").trim();
   const cfWellFormed = cfIp.length > 0 && cfIp.length < 64 && (IPV4_RE.test(cfIp) || IPV6_RE.test(cfIp));
@@ -291,12 +302,28 @@ export const API_RATE_RULES = {
   general: { name: "general", limit: 240, windowMs: 60 * 1000 },
 } as const satisfies Record<string, RateLimitRule>;
 
+/**
+ * Normalize a request path for CLASSIFICATION ONLY (the router's own
+ * matching is untouched): Express routing is lenient — a trailing slash
+ * (`/pair-code/`), case (`/PAIR-CODE`) and duplicated separators
+ * (`/sessions//x/pair-code`) all still reach the REAL handler, but the
+ * strict case-sensitive regexes below used to drop exactly those shapes
+ * into the general 240/min bucket instead of pair-code's 5/hour — a
+ * 2,880× amplification of pairing-code issuance with a leaked key
+ * (O1-H1, proven live in R111). توحيد المسار قبل التصنيف: الحالة
+ * والشرطات المكررة والزائدة.
+ */
+function normalizeClassifyPath(path: string): string {
+  return path.toLowerCase().replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+}
+
 /** Mutually exclusive bucket classification for a request path relative
  * to the /api mount point. Returns the RULE NAME (the limiter's key).
  * تصنيف الطلب إلى دلو المعدل المناسب. */
 export function classifyApiPath(path: string): "pair-code" | "sends" | "general" {
-  if (/\/pair-code$/.test(path)) return API_RATE_RULES.pairCode.name;
-  if (/\/messages\/(send-text|test)$/.test(path)) return API_RATE_RULES.sends.name;
+  const p = normalizeClassifyPath(path);
+  if (/\/pair-code$/.test(p)) return API_RATE_RULES.pairCode.name;
+  if (/\/messages\/(send-text|test)$/.test(p)) return API_RATE_RULES.sends.name;
   return API_RATE_RULES.general.name;
 }
 
