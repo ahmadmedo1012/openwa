@@ -376,8 +376,9 @@ async function startSession(rs) {
             log.info({
                 sessionId: rs.id,
                 name: rs.name,
-                // r98/98-F6 P3-3: stdout is a retained surface (Render logs) —
-                // phone digits are masked to the last 4. Full values stay in the
+                // r98/98-F6 P3-3: stdout is a retained surface (Render logs
+                // historically; Docker/Coolify logs today) — phone digits are
+                // masked to the last 4. Full values stay in the
                 // key-gated /api views and the encrypted DB blob.
                 accountDigits: maskDigits(rs.accountDigits ?? ""),
                 accountName: rs.accountName ?? null,
@@ -1010,7 +1011,7 @@ app.listen(PORT, "0.0.0.0", async () => {
     // WhatsApp request (OTP start / admin panel / readiness probe) wakes
     // it; the self-heal below then restores persisted sessions at boot,
     // so pairing survives spin-downs. /healthz stays lightweight (no DB,
-    // no session side effects) so Render's health checks remain cheap.
+    // no session side effects) so platform health checks stay cheap (Render's probes historically; Coolify's today).
     // Self-heal: auto-create + start every persisted session so a restart or
     // redeploy restores WhatsApp pairing without any operator action.
     if (!persistenceEnabled())

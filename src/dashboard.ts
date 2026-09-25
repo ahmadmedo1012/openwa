@@ -107,7 +107,8 @@ function clientIp(req: express.Request): string {
   }
   // SEC1/P1-1: the FIRST x-forwarded-for entry is client-spoofable
   // (proven live on Render — rotating a forged first entry defeated the
-  // lockout). Render's edge APPENDS the real client IP, so the LAST
+  // lockout). The trusted edge proxy (Render's edge historically;
+  // Coolify's proxy today) APPENDS the real client IP, so the LAST
   // entry is the one the trusted proxy observed. Non-proxied local
   // traffic has no XFF at all and falls back to the socket address.
   const xf = req.header("x-forwarded-for") ?? "";

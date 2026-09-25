@@ -5,15 +5,18 @@
  * timestamp arrays, plus an H11-style client-IP resolver.
  *
  * IP resolution (same posture as SubNation's cloudflareClientIp
- * middleware / the dashboard's clientIp, hardened for Render):
+ * middleware / the dashboard's clientIp, hardened for a proxy edge —
+ * Render historically, Coolify today):
  *
- *   1. Render's edge APPENDS the true connecting peer as the RIGHTMOST
+ *   1. The trusted edge proxy (Render's edge historically; Coolify's
+ *      today) APPENDS the true connecting peer as the RIGHTMOST
  *      X-Forwarded-For entry — that entry is never client-controlled,
  *      so it is the default client identity (matches dashboard.ts).
  *   2. `CF-Connecting-IP` is honoured ONLY when the rightmost XFF peer
  *      is a published Cloudflare range (the request genuinely traversed
- *      CF). A forged CF header sent directly to the *.onrender.com
- *      origin is ignored — otherwise every IP-keyed bucket would be
+ *      CF). A forged CF header sent directly to the origin (the
+ *      *.onrender.com origin historically; the Coolify-published host
+ *      today) is ignored — otherwise every IP-keyed bucket would be
  *      attacker-chosen data (H11).
  *   3. No XFF at all (local/test traffic) → socket address.
  *

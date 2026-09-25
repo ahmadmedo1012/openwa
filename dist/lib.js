@@ -173,7 +173,8 @@ export function beginSessionStart(rs, start) {
 }
 // ── PII masking for stdout logs (r98/98-F6, P3-3) ──────────────────────────
 /**
- * Redact phone digits for STDOUT logs (Render retains them): keep only the
+ * Redact phone digits for STDOUT logs (the log platform retains them —
+ * Render historically, Docker/Coolify today): keep only the
  * LAST 4 digits behind an ellipsis — "218910089975" → "…9975". Full values
  * stay where they belong: the key-gated /api responses, the delivery-log
  * ring buffer, and the encrypted DB blob. Only the log surface is masked.
@@ -261,10 +262,11 @@ export function applyConnectionClose(rs, close, fx) {
  *       attacker-chosen identity → unlimited rate-limit bucket splitting
  *       and lockout bypass.
  *   unset (or any other value) → the current deployment posture is kept:
- *       the RIGHTMOST XFF entry is trusted (Render's edge appends the
- *       true peer there; compose traffic is loopback-direct with no XFF
- *       at all). The default must stay trusting, otherwise every Render
- *       client would collapse into the edge proxy's shared buckets.
+ *       the RIGHTMOST XFF entry is trusted (the trusted edge proxy
+ *       appends the true peer there — Render's edge historically,
+ *       Coolify's proxy today; compose traffic is loopback-direct with
+ *       no XFF at all). The default must stay trusting, otherwise every
+ *       proxied client would collapse into the edge proxy's shared buckets.
  *
  * Read per-call (no import-time snapshot) so tests can flip it live.
  * مفتاح الوكيل الموثوق: تعطيل ترويسات التحويل عند النشر المباشر.

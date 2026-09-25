@@ -1,7 +1,8 @@
 /**
  * Postgres-backed credential persistence for WhatsApp sessions.
  *
- * Free-tier Render instances are ephemeral: any restart/deploy wipes the
+ * Containers are ephemeral (Render's free tier historically; Docker/Coolify
+ * redeploys today): any restart/deploy wipes the
  * local Baileys auth folder AND the in-memory registry, forcing a fresh QR
  * scan. Persisting the (encrypted) credentials blob in the app's Neon
  * database lets every boot restore previously-paired sessions automatically.
