@@ -37,7 +37,7 @@ export function disabledPage() {
 <div class="card" style="padding:32px;max-width:420px;text-align:center">
 <h2>لوحة OpenWA غير مفعّلة</h2>
 <p style="color:var(--muted)">عيّن المتغيرين <code>DASHBOARD_USERNAME</code> و
-<code>DASHBOARD_PASSWORD</code> في خدمة Render لتفعيلها.</p>
+<code>DASHBOARD_PASSWORD</code> في بيئة الخدمة (متغيرات البيئة للحاوية) لتفعيلها.</p>
 </div></body></html>`;
 }
 export function loginPage(error) {

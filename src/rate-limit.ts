@@ -340,7 +340,7 @@ const SWEEP_INTERVAL_MS = 60 * 1000;
  * windows every 60s (timer unref'd — never holds the process open).
  * Mount BEFORE the X-API-Key gate so unauthenticated key guessing is
  * bounded per IP as well; /healthz lives outside /api and stays exempt
- * (keep-alive self-ping + backend probes must never throttle).
+ * (the backend's health probes must never throttle).
  */
 export function createApiRateLimiter(
   opts: { now?: () => number; sweepIntervalMs?: number } = {},

@@ -5,8 +5,14 @@
 # free and unmetered. The gateway image is tiny (npm ci + tsc, no Chromium —
 # Baileys is pure WebSocket), so even QEMU-emulated arm64 builds stay quick.
 #
-# STATUS: NOT YET VERIFIED end-to-end (no Docker in the r107 workspace).
-# Validate with one manual workflow_dispatch run before relying on it.
+# STATUS (r113): the publish path is PROVEN — sha-tagged multi-arch images
+# are on GHCR (sha-d3f9a5d and earlier, published 2026-09-24/25). Native
+# ARM64 RUNTIME verification (running the image on a real Ampere host)
+# happens on the Oracle VM via the SubNation docker-verify harness +
+# FINAL_CUTOVER_CHECKLIST, not in this workflow. (r113 fix: the push
+# trigger's branch filter was malformed — 'ain]' instead of '[main]' —
+# since r110, so auto-publish on push silently never fired; every image
+# so far came from manual dispatches.)
 name: Docker Image (multi-arch)
 
 on:

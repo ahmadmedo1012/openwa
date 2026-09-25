@@ -33,8 +33,9 @@
  *   Lifecycle: created → initializing → qr_ready → ready →
  *              (disconnected ⇄ reconnect) | failed
  *
- * Session credentials persist under DATA_DIR/<name>/ so a scanned QR
- * survives process restarts and redeploys (attach a Render disk).
+ * Session credentials persist under ${DATA_DIR}/sessions/<name>/ so a
+ * scanned QR survives process restarts and redeploys (mount a volume at
+ * DATA_DIR — a Coolify volume / compose volume).
  */
 import express from "express";
 import pino from "pino";
@@ -1265,7 +1266,8 @@ process.on("unhandledRejection", (reason) => {
 });
 
 // ── Graceful shutdown: final persistence flush ────────────────────────────
-// Render sends SIGTERM before killing the instance (deploy / spin-down).
+// The orchestrator (Docker/Coolify) sends SIGTERM before stopping the
+// container (stop / redeploy).
 // Pending debounced saves (300ms / 3s) would die with the process, so the
 // next boot would restore a STALE snapshot → decryption failures on the
 // phone ("Waiting for this message"). Flush every ready session now, then

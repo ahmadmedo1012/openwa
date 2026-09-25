@@ -29,3 +29,13 @@ paths = [
   '''tests/persist-key-separation\.test\.mjs''',
   '''tests/r111-hardening\.test\.mjs''',
 ]
+
+# The env TEMPLATE (r113): placeholder-only by policy, same trust class as
+# SubNation2's config/env.example allowlist — its "replace-with-…" spellings
+# trip generic-api-key by keyword+length. File-exact: a real secret in any
+# other file (or a renamed template) still fails the gate.
+[[allowlists]]
+description = "Environment template file — documented placeholders only, never real values"
+paths = [
+  '''^\.env\.example$''',
+]
