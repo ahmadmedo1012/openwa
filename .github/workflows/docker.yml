@@ -11,8 +11,10 @@
 # happens on the Oracle VM via the SubNation docker-verify harness +
 # FINAL_CUTOVER_CHECKLIST, not in this workflow. (r113 fix: the push
 # trigger's branch filter was malformed — 'ain]' instead of '[main]' —
-# since r110, so auto-publish on push silently never fired; every image
-# so far came from manual dispatches.)
+# since the r110 edit. GitHub evidently ignored the invalid filter and
+# ran the workflow on every push anyway, so publishing kept working;
+# the fix scopes the trigger to main as intended instead of relying on
+# that lenient fallback.)
 name: Docker Image (multi-arch)
 
 on:
