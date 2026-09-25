@@ -53,3 +53,34 @@ jobs:
 
       - name: Build (tsc = typecheck) + tests (103 cases)
         run: npm test
+
+  # R112: secret scanning — the gateway receives the OPENWA_API_KEY,
+  # OPENWA_CREDENTIALS_KEY, and (in its Postgres persistence) encrypted
+  # WhatsApp session credentials. A leaked key in this repo is a
+  # production credential leak, so the same gitleaks gate SubNation2
+  # runs applies here. Public repo → hosted runners are free.
+  secret-scan:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan with gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # R112: the action defaults to gitleaks 8.24.3, which silently
+          # IGNORES unscoped top-level [[allowlists]] (verified empirically
+          # — the allowlist mechanism matrix lives in .gitleaks.toml).
+          # 8.27+ propagates global allowlists correctly; pin for a
+          # reproducible gate.
+          GITLEAKS_VERSION: "8.27.2"
+          # Action is MIT-licensed; this opts out of the (paid) Pro tier prompts.
+          GITLEAKS_LICENSE: "MIT"

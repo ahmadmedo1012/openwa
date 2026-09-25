@@ -1,0 +1,31 @@
+# Gitleaks configuration for the openwa WhatsApp OTP gateway
+#
+# Schema: gitleaks v8.27+ (pinned in .github/workflows/ci.yml via
+# GITLEAKS_VERSION) — unscoped top-level [[allowlists]] entries are
+# honored from 8.27 onward. Earlier binaries (8.18–8.26, including the
+# gitleaks-action default 8.24.3) silently IGNORE unscoped allowlists,
+# so do not run this config unpinned. (Verified empirically in R112 —
+# see SubNation2/.gitleaks.toml for the full mechanism matrix.)
+
+title = "openwa Secret Detection Rules"
+
+[extend]
+# Inherit gitleaks's built-in default ruleset (cloud keys, GitHub PATs,
+# WhatsApp/Baileys token shapes are covered by generic rules).
+useDefault = true
+
+# ── Allowlists ──────────────────────────────────────────────────────────────
+#
+# Test fixtures only — file-exact on purpose: a real secret committed
+# into a NEW test file must still fail the gate. The three test files
+# below set synthetic API keys ("test-api-key-0123456789abcdef",
+# "dedicated-credentials-key-0123456789abcdef") to exercise the gateway's
+# key-derivation and rate-limit middleware; they are the canonical
+# offline fixtures and are never credentials.
+[[allowlists]]
+description = "Offline test fixtures — synthetic gateway API keys for the key-separation / persist / r111-hardening suites"
+paths = [
+  '''tests/persist-hardening\.test\.mjs''',
+  '''tests/persist-key-separation\.test\.mjs''',
+  '''tests/r111-hardening\.test\.mjs''',
+]
