@@ -24,32 +24,85 @@ Auth: `X-API-Key: $OPENWA_API_KEY` on every `/api` request.
 Lifecycle: `created → initializing → qr_ready → ready`
 (`disconnected` auto-reconnects; logged-out wipes credentials and re-QRs).
 
-## Message retry contract (R149)
+## Message retry contract (R149 + R150)
 
 When a recipient device cannot decrypt a message (stale Signal session on
 their side), it asks the sender to re-send it by message id. Baileys only
 answers that request through the app-supplied `getMessage` callback —
 without it the request is silently dropped and the recipient's chat shows
 **"Waiting for this message. This may take a while."** forever
-(WhiskeySockets/Baileys#1767). The gateway now implements the full contract:
+(WhiskeySockets/Baileys#1767). The gateway implements the full contract:
 
 - Every engine-sent message's **content** is recorded by message id
-  (in-memory, per session; TTL 30 min = 6× the 5-min SubNation OTP
-  validity; capped at the latest 500 — no plaintext OTP archive at rest).
+  (per session; TTL 30 min = 6× the 5-min SubNation OTP validity; capped
+  at the latest 500).
 - `getMessage` serves that content on retry receipts — same message id, so
   the recipient's placeholder resolves into the original message (no
   duplicate), via a freshly established Signal session.
 - Resend counters live on the session record (not the socket), so the
   protocol's 5-resend bound holds across reconnects instead of re-arming
   per connection.
+- **R150 — restart persistence:** both stores ALSO survive process
+  restarts. Every mutation is flushed (atomic tmp+rename) to
+  `${DATA_DIR}/sessions/<name>/__openwa_retry_state.json`, which rides the
+  existing persistence unit: it is snapshotted into the AES-256-GCM-
+  encrypted DB blob alongside the credentials, restored on boot BEFORE the
+  engine starts, TTL-anchored to the ORIGINAL send time (a restart never
+  resets the 30-min window), and killed with the pairing by the WA-02
+  folder wipe. A container redeploy inside a message's retry window no
+  longer orphans it. At-rest exposure: plaintext only on the container-
+  local `DATA_DIR` volume — the same class as the Signal keys already
+  stored there — and inside the encrypted DB blob; bounded by TTL + cap.
 - Each retry request is logged as `[retry] resend request` with the message
   id, masked JID, and `served: true/false` — no message content is ever
   logged. A `served: false` miss means the message predates the store
-  window (sent > 30 min ago, or before a restart): the recipient must
-  request a new OTP.
+  window (sent > 30 min ago). Rehydrated boots log
+  `[retry] state rehydrated from disk`.
 
-Pairing death (`loggedOut`) clears the store — a re-paired session can
-never re-serve the old pairing's message content.
+Pairing death (`loggedOut`) clears the store AND removes the state file
+with the credentials folder — a re-paired session can never re-serve the
+old pairing's message content.
+
+### Retry-outcome observability + log PII masking (R150)
+
+Baileys is wired through a masking log adapter (`[baileys]`-prefixed
+lines): `warn`/`error` are always forwarded, `info` only when
+retry-relevant, every value JID-masked. The lines that matter when
+chasing a "Waiting for this message" report:
+
+- `[retry] resend request (getMessage)` — a recipient device asked for a
+  re-send; `served` says whether the store had it.
+- `[baileys] will not send message again, as sent too many times` — the
+  5-resend budget is exhausted; the placeholder will not resolve.
+- `[baileys] recv retry for not fromMe message` — the retry receipt was
+  NOT classified as ours (LID/PN addressing drift — collect this evidence
+  before any deeper change).
+- `[baileys] error in sending message again` — the resend itself failed.
+
+Without the adapter, Baileys' default bare-`pino()` logger forwards raw
+recipient JIDs to stdout at `info` level — the adapter closes that leak.
+
+### Deployment identity (R150)
+
+`GET /healthz` exposes `release` — the commit SHA baked into the image at
+build time (`ARG RELEASE_SHA`, wired through docker.yml). Verify a
+deployment in one request:
+
+```sh
+docker exec <gateway-container> wget -qO- http://127.0.0.1:2785/healthz
+# → {"ok":true,...,"release":"<full commit sha>"}
+```
+
+Compare against the GHCR `sha-<short>` tag the deployment pinned. `null`
+means the image was built without the arg (local dev) — never guess.
+
+### Companion identity (R150)
+
+The socket now registers as `Browsers.ubuntu("Chrome")` — the upstream
+Baileys DEFAULT — instead of the old `Windows/Chrome` override. WhatsApp
+has been 428-rejecting WIN32/DARWIN companion identities at **pairing**
+since ~2026-06-30 (WhiskeySockets/Baileys#2677); the already-linked
+session is unaffected, and the next re-pair is protected.
 
 ## Environment
 

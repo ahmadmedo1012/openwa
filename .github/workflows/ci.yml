@@ -1,4 +1,4 @@
-# CI (FH-A12 F-6): the gateway's tests (7 files, node --test) previously
+# CI (FH-A12 F-6): the gateway tests (9 files, node --test) previously
 # ran only as a manual `npm test` — gateway drift could break SubNation's
 # OTP login with no signal, because the SubNation backend consumes this
 # repo's REST contract. This repo is PUBLIC → GitHub-hosted runners are free
@@ -51,7 +51,7 @@ jobs:
       - name: Supply-chain audit (prod deps, high+)
         run: npm audit --omit=dev --audit-level=high
 
-      - name: Build (tsc = typecheck) + tests (116 cases)
+      - name: Build (tsc = typecheck) + tests (143 cases)
         run: npm test
 
   # R112: secret scanning — the gateway receives the OPENWA_API_KEY,

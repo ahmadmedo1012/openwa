@@ -82,5 +82,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # R150: bake the commit SHA into the image so /healthz `release`
+          # identifies the running binary (deployment verification).
+          build-args: |
+            RELEASE_SHA=${{ github.sha }}
           cache-from: type=gha,scope=multi-arch
           cache-to: type=gha,scope=multi-arch,mode=max

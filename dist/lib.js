@@ -11,8 +11,18 @@ export const DELIVERY_LOG_CAP = 500;
  * حد خط التسليم لكل رسالة — آخر 10 انتقالات فقط.
  */
 export const DELIVERY_TIMELINE_CAP = 10;
-export function createBoundedTtlMap(cap, ttlMs, now = Date.now) {
+export function createBoundedTtlMap(cap, ttlMs, now = Date.now, initial) {
     const entries = new Map();
+    if (initial) {
+        // Rehydrate (R150 restart persistence): expired entries NEVER resurrect
+        // (their TTL already elapsed before the restart), and the FIFO cap keeps
+        // only the NEWEST `cap` entries — the same bounds as the live map.
+        const unexpired = initial.filter((e) => e && typeof e.id === "string" && typeof e.at === "number" && now() - e.at <= ttlMs);
+        const overflow = unexpired.length - Math.max(1, cap);
+        const kept = overflow > 0 ? unexpired.slice(overflow) : unexpired;
+        for (const e of kept)
+            entries.set(e.id, { value: e.value, at: e.at });
+    }
     return {
         get(id) {
             const e = entries.get(id);
@@ -36,6 +46,7 @@ export function createBoundedTtlMap(cap, ttlMs, now = Date.now) {
         delete: (id) => entries.delete(id),
         clear: () => entries.clear(),
         size: () => entries.size,
+        snapshot: () => [...entries.entries()].map(([id, e]) => ({ id, value: e.value, at: e.at })),
     };
 }
 /**
@@ -58,6 +69,108 @@ export const RETRY_STORE_TTL_MS = 30 * 60_000;
  */
 export const MSG_RETRY_CACHE_CAP = 1_000;
 export const MSG_RETRY_CACHE_TTL_MS = 3_600_000;
+/**
+ * R150 — filename of the retry-state file inside each session's auth folder.
+ * The folder is ALREADY the persistence unit (buildSerializer snapshots every
+ * file into the AES-256-GCM-encrypted DB blob; the WA-02 wipe removes the
+ * whole folder, so the retry state dies with the pairing automatically).
+ * Underscore-prefixed so it never collides with Baileys' own auth-file names
+ * (creds.json / pre-key-* / session-* / sender-key-* / app-state-*), and it
+ * passes the restore-path filename guard (BLOB_FNAME_RE in persist.ts).
+ * اسم ملف حالة إعادة الإرسال داخل مجلد بيانات الجلسة.
+ */
+export const RETRY_STATE_FNAME = "__openwa_retry_state.json";
+/**
+ * Which Baileys info-level lines reach the gateway log: ONLY the retry-
+ * contract observables. Everything else at info is dropped — the default
+ * pino() logger Baileys falls back to (level 'info', NO masking) today
+ * forwards raw JIDs to stdout on lines like 'recv retry for not fromMe
+ * message'; this adapter both closes that PII leak and keeps the exact
+ * lines an operator needs to diagnose a "Waiting for this message" report:
+ *   'recv retry for not fromMe message'      → retry receipt misclassified
+ *   'will not send message again, as sent too many times' → budget exhausted
+ *   'error in sending message again' (error) → resend itself failed
+ * أي أسطر info من Baileys تمر فقط إذا تعلقت بإعادة الإرسال.
+ */
+export function shouldForwardBaileysInfo(msg) {
+    return typeof msg === "string" && /retry|message again|too many times/i.test(msg);
+}
+/**
+ * Deep log-value masker (R150):
+ *   - a string that IS a JID (user@domain) → maskJid;
+ *   - a string that EMBEDS digit-JIDs (e.g. an Error message) → each
+ *     embedded JID replaced by its masked form, surrounding text kept;
+ *   - a bare phone-digit string → maskDigits;
+ *   - everything else (message ids, timestamps, words) passes untouched.
+ * Objects/arrays are walked; nesting is depth-bounded; Errors contribute
+ * their (masked) message; buffer-ish values never reach the log surface.
+ * Message CONTENT never appears in Baileys log lines (it logs keys and
+ * attrs, not payloads) — this masks the identifiers.
+ * إخفاء عميق لقيم السجل — كل عنوان يُقنَّع.
+ */
+const WHOLE_JID_RE = /^[^@\s]{1,64}@(?:s\.whatsapp\.net|lid|g\.us|broadcast|newsletter)$/;
+const EMBEDDED_JID_RE = /\d{8,18}(?::\d{1,3})?@(?:s\.whatsapp\.net|lid|g\.us)/g;
+export function maskLogValue(value, depth = 0) {
+    if (depth > 8)
+        return "[depth]";
+    if (value == null)
+        return value;
+    if (typeof value === "string") {
+        if (WHOLE_JID_RE.test(value))
+            return maskJid(value);
+        if (EMBEDDED_JID_RE.test(value)) {
+            EMBEDDED_JID_RE.lastIndex = 0;
+            return value.replace(EMBEDDED_JID_RE, (m) => String(maskJid(m)));
+        }
+        if (/^\+?\d{8,18}$/.test(value))
+            return maskDigits(value);
+        return value;
+    }
+    if (typeof value === "number" || typeof value === "boolean")
+        return value;
+    if (Array.isArray(value))
+        return value.map((v) => maskLogValue(v, depth + 1));
+    if (value instanceof Error)
+        return maskLogValue(value.message, depth + 1);
+    if (typeof value === "object") {
+        // Buffer-ish (node Buffer lacks a plain typeof discriminator) — never
+        // let raw binary frames reach the log surface.
+        if (typeof value.type === "string" && Array.isArray(value.data)) {
+            return "[buffer]";
+        }
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            out[k] = maskLogValue(v, depth + 1);
+        }
+        return out;
+    }
+    return String(value);
+}
+function splitLogArgs(objOrMsg, msg) {
+    if (typeof objOrMsg === "string")
+        return { obj: {}, msg: objOrMsg };
+    return { obj: objOrMsg ?? {}, msg: msg ?? "" };
+}
+export function createBaileysLogAdapter(log, bindings = {}) {
+    const forward = (level) => (objOrMsg, msg) => {
+        const { obj, msg: text } = splitLogArgs(objOrMsg, msg);
+        const merged = { ...bindings, ...obj };
+        log[level](maskLogValue(merged), `[baileys] ${text}`);
+    };
+    return {
+        level: "info",
+        trace: () => { },
+        debug: () => { },
+        info: (objOrMsg, msg) => {
+            const { msg: text } = splitLogArgs(objOrMsg, msg);
+            if (shouldForwardBaileysInfo(text))
+                forward("info")(objOrMsg, msg);
+        },
+        warn: forward("warn"),
+        error: forward("error"),
+        child: (childBindings) => createBaileysLogAdapter(log, { ...bindings, ...childBindings }),
+    };
+}
 // ── Delivery-status semantics (WA-04) ──────────────────────────────────────
 /**
  * WhatsApp protocol delivery statuses — WebMessageInfo.Status enum,

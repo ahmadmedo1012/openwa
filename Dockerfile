@@ -2,6 +2,9 @@
 # R104 (AG12-2/AG12-3): lockfile-faithful builds (npm ci, not npm install)
 # and a production-only runtime image (devDeps no longer ship — was
 # ~60-90 MB of typescript/tsx/@types dead weight in every pull).
+# R150: ARG/ENV RELEASE_SHA — baked by docker.yml (build-args) so the
+# running binary identifies itself on /healthz (`release` field): the
+# one-request answer to "did the intended image actually get deployed?".
 FROM node:22-alpine AS build
 WORKDIR /app
 # No git needed in this deps stage (110-K, corrects the stale R104 note):
@@ -22,7 +25,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
 FROM node:22-alpine
-ENV NODE_ENV=production DATA_DIR=/data PORT=2785
+# R150: full commit SHA (docker.yml passes github.sha) → /healthz release.
+ARG RELEASE_SHA=""
+ENV NODE_ENV=production DATA_DIR=/data PORT=2785 OPENWA_RELEASE_SHA=${RELEASE_SHA}
 WORKDIR /app
 COPY --from=deps-prod /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

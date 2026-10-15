@@ -39,13 +39,13 @@
  */
 import express from "express";
 import pino from "pino";
-import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, } from "@whiskeysockets/baileys";
+import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, Browsers, } from "@whiskeysockets/baileys";
 import { nanoid } from "nanoid";
 import { timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { persistenceEnabled, scheduleSave, flushNow, persistAge, loadCreds, listPersistedNames, deletePersisted, cancelPendingSave, isSafeBlobFilename, } from "./persist.js";
-import { normalizeChatId, extractAccountDigits, extractLidDigits, resolveSendJid, mergeDeliveryTimeline, pushDeliveryLog, advanceDeliveryStatus, applyConnectionClose, asyncHandler, beginSessionStart, httpErrorStatus, maskDigits, maskJid, shouldPreferDbBlobOverLocal, createBoundedTtlMap, RETRY_STORE_CAP, RETRY_STORE_TTL_MS, MSG_RETRY_CACHE_CAP, MSG_RETRY_CACHE_TTL_MS, } from "./lib.js";
+import { normalizeChatId, extractAccountDigits, extractLidDigits, resolveSendJid, mergeDeliveryTimeline, pushDeliveryLog, advanceDeliveryStatus, applyConnectionClose, asyncHandler, beginSessionStart, httpErrorStatus, maskDigits, maskJid, shouldPreferDbBlobOverLocal, createBoundedTtlMap, createBaileysLogAdapter, RETRY_STATE_FNAME, RETRY_STORE_CAP, RETRY_STORE_TTL_MS, MSG_RETRY_CACHE_CAP, MSG_RETRY_CACHE_TTL_MS, } from "./lib.js";
 import { createApiRateLimiter } from "./rate-limit.js";
 import { mountDashboard } from "./dashboard-routes.js";
 import { dashboardEnabled } from "./dashboard.js";
@@ -53,6 +53,18 @@ const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 const PORT = Number(process.env.PORT ?? 2785);
 const API_KEY = (process.env.OPENWA_API_KEY ?? "").trim();
 const DATA_DIR = (process.env.DATA_DIR ?? "/data").replace(/\/+$/, "");
+/**
+ * R150 — release identity. Baked into the image at build time
+ * (Dockerfile ARG RELEASE_SHA ← docker.yml build-args) and exposed on the
+ * UNAUTHENTICATED /healthz so the running binary is verifiable in one curl:
+ * `docker exec <gateway> wget -qO- localhost:2785/healthz` → compare the
+ * `release` field against the GHCR tag. Closes the "did the intended image
+ * actually get deployed?" verification gap (R149 shipped the fix but the
+ * running binary could not be checked from outside Coolify). Null = local
+ * dev run / image built without the arg — stated honestly, never guessed.
+ * هوية الإصدار — للتحقق من الصورة العاملة بطلب واحد.
+ */
+const RELEASE_SHA = (process.env.OPENWA_RELEASE_SHA ?? "").trim() || null;
 // Self-send LID routing (OTP to the operator's own number): on by default,
 // opt-out with OPENWA_SELF_SEND_LID=0. توجيه المحادثة الذاتية عبر LID.
 const SELF_SEND_LID_ENABLED = (process.env.OPENWA_SELF_SEND_LID ?? "").trim() !== "0";
@@ -107,6 +119,77 @@ function buildSerializer(name) {
         }
         return JSON.stringify(out);
     };
+}
+// ── R150 — retry-state restart persistence ───────────────────────────────
+/**
+ * Serialize both retry-contract stores (outbound messages + resend
+ * counters) into the on-disk state-file shape.
+ */
+function serializeRetryState(rs) {
+    return {
+        v: 1,
+        savedAt: Date.now(),
+        messages: rs.retryMessages?.snapshot() ?? [],
+        counters: rs.msgRetryCounters?.snapshot() ?? [],
+    };
+}
+/**
+ * Write the retry-state file ATOMICALLY (tmp + rename) so a torn write is
+ * never readable. The file lives INSIDE the session's auth folder — the
+ * existing persistence unit: buildSerializer snapshots it into the
+ * AES-256-GCM-encrypted DB blob on every save, the DB restore writes it
+ * back before useMultiFileAuthState reads the folder, and the WA-02 wipe
+ * (rm -rf of the folder) kills it with the pairing automatically.
+ * كتابة ملف الحالة ذريًا داخل مجلد بيانات الجلسة.
+ */
+async function writeRetryStateFile(rs) {
+    const dir = `${DATA_DIR}/sessions/${rs.name}`;
+    const target = path.join(dir, RETRY_STATE_FNAME);
+    const tmp = `${target}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(serializeRetryState(rs)));
+    await fs.rename(tmp, target);
+}
+/**
+ * Fire-and-forget state write after every retry-contract mutation (send,
+ * counter bump, eviction-relevant delete). Retry receipts are rare and
+ * sends are rate-limited — one small JSON write per mutation is noise. A
+ * write failure (post-wipe window / transient fs) is swallowed: the file is
+ * a cache for the retry contract, not a ledger; the next mutation rewrites
+ * it and the TTL bounds anything lost. الكتابة بعد كل تعديل — فشلها غير فادح.
+ */
+function scheduleRetryStateWrite(rs) {
+    void writeRetryStateFile(rs).catch(() => { });
+}
+/**
+ * Read + validate the retry-state file for a session (null = absent,
+ * unreadable, torn, or unknown format — ALWAYS safe to treat as fresh,
+ * never a boot crash). Malformed entries are dropped individually.
+ */
+async function readRetryStateFile(name) {
+    try {
+        const raw = await fs.readFile(path.join(DATA_DIR, "sessions", name, RETRY_STATE_FNAME), "utf8");
+        const parsed = JSON.parse(raw);
+        if (parsed?.v !== 1)
+            return null;
+        const messages = Array.isArray(parsed.messages)
+            ? parsed.messages.filter((e) => e != null && typeof e.id === "string" && typeof e.at === "number")
+            : [];
+        const counters = Array.isArray(parsed.counters)
+            ? parsed.counters.filter((e) => e != null &&
+                typeof e.id === "string" &&
+                typeof e.at === "number" &&
+                typeof e.value === "number")
+            : [];
+        return {
+            v: 1,
+            savedAt: typeof parsed.savedAt === "number" ? parsed.savedAt : 0,
+            messages,
+            counters,
+        };
+    }
+    catch {
+        return null;
+    }
 }
 async function startSession(rs) {
     rs.stopRequested = false;
@@ -236,16 +319,43 @@ async function startSession(rs) {
     // (startSession runs again with a fresh socket) KEEPS them instead of
     // starting empty — retry receipts for messages sent before the reconnect
     // still resolve, and resend counters never reset mid-window.
-    // كلا المخزنين على سجل الجلسة — يبقيان عبر إعادة الاتصال.
-    const retryMessages = (rs.retryMessages ??= createBoundedTtlMap(RETRY_STORE_CAP, RETRY_STORE_TTL_MS));
-    const msgRetryCounters = (rs.msgRetryCounters ??= createBoundedTtlMap(MSG_RETRY_CACHE_CAP, MSG_RETRY_CACHE_TTL_MS));
+    // R150 — the stores ALSO survive PROCESS restarts now: on a fresh boot the
+    // lazy-init seeds from the on-disk retry-state file (written on every
+    // mutation, riding the existing encrypted persistence snapshot). A
+    // container redeploy no longer orphans in-flight OTPs: a recipient whose
+    // device requests a re-send after the restart is still served the original
+    // content. كلا المخزنين يبقيان عبر إعادة الاتصال وعبر إعادة تشغيل الحاوية.
+    const storesExisted = rs.retryMessages !== undefined;
+    let retryState = null;
+    if (!storesExisted) {
+        retryState = await readRetryStateFile(rs.name);
+    }
+    const retryMessages = (rs.retryMessages ??= createBoundedTtlMap(RETRY_STORE_CAP, RETRY_STORE_TTL_MS, Date.now, retryState?.messages));
+    const msgRetryCounters = (rs.msgRetryCounters ??= createBoundedTtlMap(MSG_RETRY_CACHE_CAP, MSG_RETRY_CACHE_TTL_MS, Date.now, retryState?.counters));
+    if (!storesExisted && (retryMessages.size() > 0 || msgRetryCounters.size() > 0)) {
+        log.info({ sessionId: rs.id, name: rs.name, messages: retryMessages.size(), counters: msgRetryCounters.size() }, "[retry] state rehydrated from disk (restart persistence)");
+    }
     const sock = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: false,
-        browser: ["Windows", "Chrome", "133.0"],
+        // R150: Ubuntu/Chrome — the upstream Baileys DEFAULT (Defaults/index.js
+        // ships Browsers.ubuntu('Chrome')). The old ["Windows","Chrome",…]
+        // override maps to WebSubPlatform.WIN32, which WhatsApp has been
+        // 428-REJECTING at pairing since ~2026-06-30 (WhiskeySockets/Baileys
+        // #2677; upstream master's fix is exactly this identity change). The
+        // current linked session keeps working; the next re-pair is protected.
+        browser: Browsers.ubuntu("Chrome"),
         markOnlineOnConnect: false,
         syncFullHistory: false,
+        // R150: retry-outcome observability + PII masking. Without a logger,
+        // Baileys falls back to a bare pino() at level 'info' with NO masking —
+        // raw recipient JIDs reach the retained stdout surface, while the exact
+        // retry-relevant lines an operator needs are drowned in noise. The
+        // adapter forwards warn/error always and info only when retry-relevant,
+        // JID-masked (maskLogValue), prefixed [baileys]. One documented cast —
+        // same discipline as the R149 CacheStore cast below.
+        logger: createBaileysLogAdapter(log),
         // R149: serve the original message content when a recipient device asks
         // for a re-send (retry receipt). The miss path returns undefined —
         // Baileys logs and drops it, the safe explicit result (never a stub).
@@ -265,13 +375,26 @@ async function startSession(rs) {
         },
         // R149: counters on the session record — survive reconnects (the default
         // per-socket NodeCache resets on every reconnect, re-arming the 5-resend
-        // budget per connection). Cast: CacheStore.get<T> is generic; values are
-        // always numbers here (Baileys stores retry counts only).
+        // budget per connection). R150: every counter mutation also rewrites the
+        // on-disk state file so the bound stays total across PROCESS restarts
+        // too (a restart must not re-arm an exhausted budget). Cast: CacheStore.get<T>
+        // is generic; values are always numbers here (Baileys stores retry counts only).
         msgRetryCounterCache: {
             get: (key) => msgRetryCounters.get(key),
-            set: (key, value) => msgRetryCounters.set(key, value),
-            del: (key) => msgRetryCounters.delete(key),
-            flushAll: () => msgRetryCounters.clear(),
+            set: (key, value) => {
+                msgRetryCounters.set(key, value);
+                scheduleRetryStateWrite(rs);
+            },
+            del: (key) => {
+                const deleted = msgRetryCounters.delete(key);
+                if (deleted)
+                    scheduleRetryStateWrite(rs);
+                return deleted;
+            },
+            flushAll: () => {
+                msgRetryCounters.clear();
+                scheduleRetryStateWrite(rs);
+            },
         },
     });
     rs.socket = sock;
@@ -588,7 +711,16 @@ app.use((_req, res, next) => {
 app.use(express.json({ limit: "256kb" }));
 app.get("/healthz", (_req, res) => {
     const ready = [...sessions.values()].filter((s) => s.status === "ready").length;
-    res.json({ ok: true, sessions: sessions.size, ready, dashboard: dashboardEnabled() });
+    // R150: `release` = OPENWA_RELEASE_SHA baked at image build (null on a
+    // local/dev run) — the one-request answer to "which binary is running?".
+    // Compare against the GHCR sha-<short> tag to verify a deployment.
+    res.json({
+        ok: true,
+        sessions: sessions.size,
+        ready,
+        dashboard: dashboardEnabled(),
+        release: RELEASE_SHA,
+    });
 });
 // ── Operator dashboard (browser UI) ───────────────────────────────────────────
 // Mounted BEFORE the /api key gate: it authenticates with its own signed
@@ -918,9 +1050,12 @@ async function engineSend(rs, chatIdRaw, text) {
         // R149: record the outbound CONTENT by id — this is what getMessage
         // serves when the recipient's device requests a re-send (retry receipt).
         // Without it the recipient's "Waiting for this message" never resolves.
-        // تسجيل محتوى الرسالة الصادرة لخدمة طلبات إعادة الإرسال.
+        // R150: the mutation is flushed to the on-disk state file immediately so
+        // a container redeploy inside the retry window keeps the contract.
+        // تسجيل محتوى الرسالة الصادرة ودفعه للملف فورًا.
         if (messageId && msg?.message) {
             rs.retryMessages?.set(messageId, msg.message);
+            scheduleRetryStateWrite(rs);
         }
     }
     catch (err) {
@@ -936,9 +1071,11 @@ async function engineSend(rs, chatIdRaw, text) {
             const id = msg?.key?.id;
             messageId = typeof id === "string" ? id : null;
             usedJid = route.pnJid;
-            // R149: same retry-contract capture on the PN fallback path.
+            // R149: same retry-contract capture on the PN fallback path
+            // (R150: + immediate state-file flush, same as the primary path).
             if (messageId && msg?.message) {
                 rs.retryMessages?.set(messageId, msg.message);
+                scheduleRetryStateWrite(rs);
             }
         }
         catch (err2) {
