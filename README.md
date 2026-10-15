@@ -24,6 +24,33 @@ Auth: `X-API-Key: $OPENWA_API_KEY` on every `/api` request.
 Lifecycle: `created → initializing → qr_ready → ready`
 (`disconnected` auto-reconnects; logged-out wipes credentials and re-QRs).
 
+## Message retry contract (R149)
+
+When a recipient device cannot decrypt a message (stale Signal session on
+their side), it asks the sender to re-send it by message id. Baileys only
+answers that request through the app-supplied `getMessage` callback —
+without it the request is silently dropped and the recipient's chat shows
+**"Waiting for this message. This may take a while."** forever
+(WhiskeySockets/Baileys#1767). The gateway now implements the full contract:
+
+- Every engine-sent message's **content** is recorded by message id
+  (in-memory, per session; TTL 30 min = 6× the 5-min SubNation OTP
+  validity; capped at the latest 500 — no plaintext OTP archive at rest).
+- `getMessage` serves that content on retry receipts — same message id, so
+  the recipient's placeholder resolves into the original message (no
+  duplicate), via a freshly established Signal session.
+- Resend counters live on the session record (not the socket), so the
+  protocol's 5-resend bound holds across reconnects instead of re-arming
+  per connection.
+- Each retry request is logged as `[retry] resend request` with the message
+  id, masked JID, and `served: true/false` — no message content is ever
+  logged. A `served: false` miss means the message predates the store
+  window (sent > 30 min ago, or before a restart): the recipient must
+  request a new OTP.
+
+Pairing death (`loggedOut`) clears the store — a re-paired session can
+never re-serve the old pairing's message content.
+
 ## Environment
 
 | Var | Required | Meaning |

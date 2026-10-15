@@ -47,6 +47,8 @@ import {
   type WASocket,
   type SignalDataSet,
   type SignalKeyStore,
+  type CacheStore,
+  type proto,
 } from "@whiskeysockets/baileys";
 import { nanoid } from "nanoid";
 import { timingSafeEqual } from "node:crypto";
@@ -78,6 +80,12 @@ import {
   maskDigits,
   maskJid,
   shouldPreferDbBlobOverLocal,
+  createBoundedTtlMap,
+  RETRY_STORE_CAP,
+  RETRY_STORE_TTL_MS,
+  MSG_RETRY_CACHE_CAP,
+  MSG_RETRY_CACHE_TTL_MS,
+  type BoundedTtlMap,
   type DeliveryLogEntry,
 } from "./lib.js";
 import { createApiRateLimiter } from "./rate-limit.js";
@@ -156,6 +164,32 @@ interface RuntimeSession extends SessionRecord {
    * (DELIVERY_LOG_CAP, lib.ts). */
   deliveryLog?: DeliveryLogEntry[];
   lastDeliveryStatus?: string;
+  /**
+   * R149 — the "Waiting for this message" fix: outbound message CONTENT by
+   * message id, feeding Baileys' getMessage retry contract. When a
+   * recipient device cannot decrypt and requests a re-send (retry receipt),
+   * Baileys calls getMessage(key) — without a store it silently drops the
+   * request and the recipient's placeholder is permanent (Baileys 6.7.24
+   * messages-recv.js sendMessagesAgain; WhiskeySockets/Baileys#1767).
+   * Lives on the SESSION RECORD (not the socket) so it survives reconnects;
+   * in-memory only — no plaintext OTP archive at rest (TTL 30 min = 6× the
+   * OTP validity; cap 500). Cleared on pairing death (resetSessionIdentity).
+   * مخزن محتوى الرسائل الصادرة لتغذية عقد إعادة الإرسال في Baileys.
+   *
+   * shortcut: a message sent moments before a process restart loses retry
+   * coverage until the restart completes — acceptable because retries arrive
+   * seconds after send while the socket is online; revisit only if restarts
+   * become frequent enough to matter.
+   */
+  retryMessages?: BoundedTtlMap<proto.IMessage>;
+  /**
+   * R149: Baileys msgRetryCounterCache on the session record — counters
+   * survive reconnects instead of resetting with each socket (the default
+   * per-socket NodeCache), so the 5-resend protocol bound is enforced across
+   * the message's whole retry window, not per connection.
+   * عدّاد محاولات إعادة الإرسال — يبقى عبر إعادة الاتصال.
+   */
+  msgRetryCounters?: BoundedTtlMap<number>;
   /** Linked-account identity, captured at connection open. هوية الحساب المرتبط. */
   accountDigits?: string;
   accountName?: string;
@@ -360,6 +394,21 @@ async function startSession(rs: RuntimeSession): Promise<void> {
     rs.status = "initializing";
   }
 
+  // R149 — the retry contract (root cause of "Waiting for this message"):
+  // both stores live on the SESSION RECORD and lazy-init, so a reconnect
+  // (startSession runs again with a fresh socket) KEEPS them instead of
+  // starting empty — retry receipts for messages sent before the reconnect
+  // still resolve, and resend counters never reset mid-window.
+  // كلا المخزنين على سجل الجلسة — يبقيان عبر إعادة الاتصال.
+  const retryMessages = (rs.retryMessages ??= createBoundedTtlMap<proto.IMessage>(
+    RETRY_STORE_CAP,
+    RETRY_STORE_TTL_MS,
+  ));
+  const msgRetryCounters = (rs.msgRetryCounters ??= createBoundedTtlMap<number>(
+    MSG_RETRY_CACHE_CAP,
+    MSG_RETRY_CACHE_TTL_MS,
+  ));
+
   const sock = makeWASocket({
     version,
     auth: state,
@@ -367,6 +416,36 @@ async function startSession(rs: RuntimeSession): Promise<void> {
     browser: ["Windows", "Chrome", "133.0"],
     markOnlineOnConnect: false,
     syncFullHistory: false,
+    // R149: serve the original message content when a recipient device asks
+    // for a re-send (retry receipt). The miss path returns undefined —
+    // Baileys logs and drops it, the safe explicit result (never a stub).
+    // Every call = a real retry request: logged (privacy-preserving — id +
+    // masked JID only) so operators can SEE resend requests being served.
+    // توفير محتوى الرسالة الأصلية عند طلب إعادة الإرسال.
+    getMessage: async (key) => {
+      const id = typeof key?.id === "string" ? key.id : undefined;
+      const msg = id ? retryMessages.get(id) : undefined;
+      log.info(
+        {
+          sessionId: rs.id,
+          messageId: id ?? null,
+          chatId: maskJid(String(key?.remoteJid ?? "")),
+          served: Boolean(msg),
+        },
+        "[retry] resend request (getMessage)",
+      );
+      return msg;
+    },
+    // R149: counters on the session record — survive reconnects (the default
+    // per-socket NodeCache resets on every reconnect, re-arming the 5-resend
+    // budget per connection). Cast: CacheStore.get<T> is generic; values are
+    // always numbers here (Baileys stores retry counts only).
+    msgRetryCounterCache: {
+      get: (key: string) => msgRetryCounters.get(key),
+      set: (key: string, value: number) => msgRetryCounters.set(key, value),
+      del: (key: string) => msgRetryCounters.delete(key),
+      flushAll: () => msgRetryCounters.clear(),
+    } as CacheStore,
   });
   rs.socket = sock;
   // O1-M1 (R111): a DELETE that landed while this start was still in
@@ -1070,6 +1149,13 @@ async function engineSend(
     const msg = await sock.sendMessage(route.jid, { text });
     const id = msg?.key?.id;
     messageId = typeof id === "string" ? id : null;
+    // R149: record the outbound CONTENT by id — this is what getMessage
+    // serves when the recipient's device requests a re-send (retry receipt).
+    // Without it the recipient's "Waiting for this message" never resolves.
+    // تسجيل محتوى الرسالة الصادرة لخدمة طلبات إعادة الإرسال.
+    if (messageId && msg?.message) {
+      rs.retryMessages?.set(messageId, msg.message);
+    }
   } catch (err) {
     if (!route.viaLid) {
       log.error({ err, sessionId: rs.id, chatId: maskDigits(targetDigits) }, "[send] failed");
@@ -1083,6 +1169,10 @@ async function engineSend(
       const id = msg?.key?.id;
       messageId = typeof id === "string" ? id : null;
       usedJid = route.pnJid;
+      // R149: same retry-contract capture on the PN fallback path.
+      if (messageId && msg?.message) {
+        rs.retryMessages?.set(messageId, msg.message);
+      }
     } catch (err2) {
       log.error({ err: err2, sessionId: rs.id, chatId: maskDigits(targetDigits) }, "[send] PN retry failed too");
       return { ok: false, code: 500, error: "send_failed" };

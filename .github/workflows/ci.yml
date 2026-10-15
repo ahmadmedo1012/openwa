@@ -51,7 +51,7 @@ jobs:
       - name: Supply-chain audit (prod deps, high+)
         run: npm audit --omit=dev --audit-level=high
 
-      - name: Build (tsc = typecheck) + tests (103 cases)
+      - name: Build (tsc = typecheck) + tests (116 cases)
         run: npm test
 
   # R112: secret scanning — the gateway receives the OPENWA_API_KEY,

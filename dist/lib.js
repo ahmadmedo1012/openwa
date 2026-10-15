@@ -11,6 +11,53 @@ export const DELIVERY_LOG_CAP = 500;
  * حد خط التسليم لكل رسالة — آخر 10 انتقالات فقط.
  */
 export const DELIVERY_TIMELINE_CAP = 10;
+export function createBoundedTtlMap(cap, ttlMs, now = Date.now) {
+    const entries = new Map();
+    return {
+        get(id) {
+            const e = entries.get(id);
+            if (!e)
+                return undefined;
+            if (now() - e.at > ttlMs) {
+                entries.delete(id); // expired — evict on read, no sweep timer needed
+                return undefined;
+            }
+            return e.value;
+        },
+        set(id, value) {
+            entries.set(id, { value, at: now() });
+            // Map preserves insertion order — evict the OLDEST key past the cap.
+            if (entries.size > Math.max(1, cap)) {
+                const oldest = entries.keys().next().value;
+                if (oldest !== undefined)
+                    entries.delete(oldest);
+            }
+        },
+        delete: (id) => entries.delete(id),
+        clear: () => entries.clear(),
+        size: () => entries.size,
+    };
+}
+/**
+ * R149 retry-store bounds. Cap 500 = the DELIVERY_LOG_CAP discipline (latest
+ * engine-sent messages kept, oldest dropped). TTL 30 min = 6× the SubNation
+ * OTP validity (5 min, backend/src/lib/whatsapp-otp.ts OTP_TTL_SEC) — the
+ * shortest window with comfortable headroom over when retry receipts
+ * actually arrive (seconds after send); the Baileys protocol's own retry
+ * cache TTL is 1 h, so 30 min stays well inside every retry window without
+ * retaining expired OTP plaintext any longer than defensible.
+ */
+export const RETRY_STORE_CAP = 500;
+export const RETRY_STORE_TTL_MS = 30 * 60_000;
+/**
+ * R149 msgRetryCounterCache bounds — TTL matches Baileys' own
+ * DEFAULT_CACHE_TTLS.MSG_RETRY (1 h) so reconnect-persistent counters keep
+ * the same expiry semantics the per-socket NodeCache default had; cap bounds
+ * the map across pathological retry traffic (counters only exist for
+ * messages that actually got retry receipts).
+ */
+export const MSG_RETRY_CACHE_CAP = 1_000;
+export const MSG_RETRY_CACHE_TTL_MS = 3_600_000;
 // ── Delivery-status semantics (WA-04) ──────────────────────────────────────
 /**
  * WhatsApp protocol delivery statuses — WebMessageInfo.Status enum,
@@ -211,6 +258,10 @@ export function resetSessionIdentity(rs) {
     rs.accountLidDigits = undefined;
     rs.lastDeliveryStatus = undefined;
     rs.deliveryLog = [];
+    // R149: the dead pairing's outbound message content dies with it — a
+    // re-paired session must never be able to re-serve the old pairing's OTP
+    // plaintext through getMessage. محتوى رسائل الاقتران الميت يُمسح معه.
+    rs.retryMessages?.clear();
 }
 /**
  * Reducer for the connection.update "close" event — extracted verbatim

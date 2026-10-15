@@ -27,6 +27,77 @@ export const DELIVERY_LOG_CAP = 500;
  */
 export const DELIVERY_TIMELINE_CAP = 10;
 
+// ── Outbound message retry store (R149 — the "Waiting for this message" fix) ─
+
+/**
+ * Bounded TTL map — the primitive behind BOTH R149 retry-contract stores:
+ * the per-session outbound-message store (feeds Baileys' getMessage) and the
+ * per-session msgRetryCounterCache (survives reconnects). Map-backed, FIFO
+ * eviction past `cap`, lazy TTL on read, clock injectable for tests.
+ * خريطة محدودة بعمر — أساس مخزن إعادة الإرسال وعدّاد المحاولات.
+ */
+export interface BoundedTtlMap<T> {
+  /** undefined when absent OR expired — the safe explicit miss. */
+  get(id: string): T | undefined;
+  set(id: string, value: T): void;
+  delete(id: string): boolean;
+  /** Drop every entry (pairing death — WA-02 discipline). */
+  clear(): void;
+  size(): number;
+}
+
+export function createBoundedTtlMap<T>(
+  cap: number,
+  ttlMs: number,
+  now: () => number = Date.now,
+): BoundedTtlMap<T> {
+  const entries = new Map<string, { value: T; at: number }>();
+  return {
+    get(id) {
+      const e = entries.get(id);
+      if (!e) return undefined;
+      if (now() - e.at > ttlMs) {
+        entries.delete(id); // expired — evict on read, no sweep timer needed
+        return undefined;
+      }
+      return e.value;
+    },
+    set(id, value) {
+      entries.set(id, { value, at: now() });
+      // Map preserves insertion order — evict the OLDEST key past the cap.
+      if (entries.size > Math.max(1, cap)) {
+        const oldest = entries.keys().next().value;
+        if (oldest !== undefined) entries.delete(oldest);
+      }
+    },
+    delete: (id) => entries.delete(id),
+    clear: () => entries.clear(),
+    size: () => entries.size,
+  };
+}
+
+/**
+ * R149 retry-store bounds. Cap 500 = the DELIVERY_LOG_CAP discipline (latest
+ * engine-sent messages kept, oldest dropped). TTL 30 min = 6× the SubNation
+ * OTP validity (5 min, backend/src/lib/whatsapp-otp.ts OTP_TTL_SEC) — the
+ * shortest window with comfortable headroom over when retry receipts
+ * actually arrive (seconds after send); the Baileys protocol's own retry
+ * cache TTL is 1 h, so 30 min stays well inside every retry window without
+ * retaining expired OTP plaintext any longer than defensible.
+ */
+export const RETRY_STORE_CAP = 500;
+export const RETRY_STORE_TTL_MS = 30 * 60_000;
+
+/**
+ * R149 msgRetryCounterCache bounds — TTL matches Baileys' own
+ * DEFAULT_CACHE_TTLS.MSG_RETRY (1 h) so reconnect-persistent counters keep
+ * the same expiry semantics the per-socket NodeCache default had; cap bounds
+ * the map across pathological retry traffic (counters only exist for
+ * messages that actually got retry receipts).
+ */
+export const MSG_RETRY_CACHE_CAP = 1_000;
+export const MSG_RETRY_CACHE_TTL_MS = 3_600_000;
+
 // ── Delivery-status semantics (WA-04) ──────────────────────────────────────
 
 /**
@@ -306,6 +377,14 @@ export interface SessionIdentityState {
   accountLidDigits?: string;
   lastDeliveryStatus?: string;
   deliveryLog?: DeliveryLogEntry[];
+  /**
+   * R149: the per-session outbound-message store feeding getMessage. Old
+   * pairing's message content must die with the pairing (WA-02 + privacy:
+   * no expired-OTP plaintext survives a re-pair). Structural `{ clear }` so
+   * lib.ts stays dependency-free (the concrete BoundedTtlMap lives in
+   * index.ts's RuntimeSession).
+   */
+  retryMessages?: { clear(): void };
 }
 
 /**
@@ -321,6 +400,10 @@ export function resetSessionIdentity(rs: SessionIdentityState): void {
   rs.accountLidDigits = undefined;
   rs.lastDeliveryStatus = undefined;
   rs.deliveryLog = [];
+  // R149: the dead pairing's outbound message content dies with it — a
+  // re-paired session must never be able to re-serve the old pairing's OTP
+  // plaintext through getMessage. محتوى رسائل الاقتران الميت يُمسح معه.
+  rs.retryMessages?.clear();
 }
 
 /** Runtime fields the connection-close reducer touches. */
