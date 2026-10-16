@@ -1087,11 +1087,18 @@ async function engineSend(rs, chatIdRaw, text) {
     // matched against this, never against arbitrary fromMe traffic.
     // تسجيل معرف الرسالة الفعلي في سجل التسليم (حلقة بحد 500).
     if (messageId) {
+        // relayMessage resolved = handed to the server: PENDING (WAProto 1) is
+        // the truthful floor. Self-chat sends never get receipts (sender IS the
+        // recipient), so without this seed the timeline stays blank forever —
+        // indistinguishable from a lost send.
+        const nowIso = new Date().toISOString();
         rs.deliveryLog = pushDeliveryLog(rs.deliveryLog ?? [], {
             messageId,
             chatId: usedJid,
-            sentAt: new Date().toISOString(),
-            timeline: [],
+            sentAt: nowIso,
+            timeline: [{ status: "1", at: nowIso }],
+            lastStatus: "1",
+            maxStatus: "1",
         });
     }
     log.info({
